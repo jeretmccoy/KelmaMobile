@@ -1,0 +1,23 @@
+[package]
+name = "kelma_core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+anki = { path = "../../vendor/anki/rslib", features = ["rustls"] }
+anki_proto = { path = "../../vendor/anki/rslib/proto" }
+prost = "0.13"
+serde_json = "1"
+url = "2"
+# NOTE: `reqwest` and `tokio` must resolve to the exact versions rslib links
+# against (see ../../vendor/anki/Cargo.lock), otherwise the `Client` passed to
+# `Collection::normal_sync`/`full_upload`/`full_download` will be a different
+# type. Keep these pinned in lockstep with the vendored Anki submodule.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+

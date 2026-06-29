@@ -66,6 +66,9 @@ yarn-error.log
 # testing
 /coverage
 
+# Rust
+/rust/kelma-core/target/
+
 # Yarn
 .yarn/*
 !.yarn/patches

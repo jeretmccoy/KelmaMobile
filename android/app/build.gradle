@@ -110,6 +110,9 @@ android {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
+    // Anki's real Rust collection/scheduler/sync backend, packaged with its
+    // generated Kotlin protobuf API. Keep this aligned with upstream AnkiDroid.
+    implementation("io.github.david-allison:anki-android-backend:0.1.64-anki25.09.2")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

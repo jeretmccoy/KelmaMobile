@@ -3,6 +3,9 @@ PODS:
   - hermes-engine (250829098.0.14):
     - hermes-engine/Pre-built (= 250829098.0.14)
   - hermes-engine/Pre-built (250829098.0.14)
+  - KelmaCore (0.1.0):
+    - React-Core
+    - ReactCodegen
   - RCTDeprecation (0.86.0)
   - RCTRequired (0.86.0)
   - RCTSwiftUI (0.86.0)
@@ -1897,6 +1900,7 @@ PODS:
 DEPENDENCIES:
   - FBLazyVector (from `../node_modules/react-native/Libraries/FBLazyVector`)
   - hermes-engine (from `../node_modules/react-native/sdks/hermes-engine/hermes-engine.podspec`)
+  - KelmaCore (from `..`)
   - RCTDeprecation (from `../node_modules/react-native/ReactApple/Libraries/RCTFoundation/RCTDeprecation`)
   - RCTRequired (from `../node_modules/react-native/Libraries/Required`)
   - RCTSwiftUI (from `../node_modules/react-native/ReactApple/RCTSwiftUI`)
@@ -1979,6 +1983,8 @@ EXTERNAL SOURCES:
   hermes-engine:
     :podspec: "../node_modules/react-native/sdks/hermes-engine/hermes-engine.podspec"
     :tag: hermes-v250829098.0.14
+  KelmaCore:
+    :path: ".."
   RCTDeprecation:
     :path: "../node_modules/react-native/ReactApple/Libraries/RCTFoundation/RCTDeprecation"
   RCTRequired:
@@ -2131,6 +2137,7 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   FBLazyVector: b3e7ad108f0d882e30445c5527d774e3fd432f3d
   hermes-engine: d9b2b5ee50e05d39a55a7d5533962fe24ec710b2
+  KelmaCore: a73d17995f780b8407f92ad83b2821085cdab70d
   RCTDeprecation: 2a74a2c57675e64419bd89078efde81f7c1de90b
   RCTRequired: 30451112e6fef4e6f31b4e7eee0845156e35e4b0
   RCTSwiftUI: 5aaf0b07e747ba749dc6acc94d8bd41eea4b570f
@@ -2201,11 +2208,11 @@ SPEC CHECKSUMS:
   React-viewtransitionnativemodule: 8556c844dcd691ab3fe1b32bbf8f58c8c9a49c75
   React-webperformancenativemodule: 4d1d0258107fe0cb8ef5c9ac17a6a099785f2995
   ReactAppDependencyProvider: adf5403892170fbe996fce485a703f25df08db66
-  ReactCodegen: ee39bbc365b4791c9b5183b52c533ebf586e1d8d
+  ReactCodegen: d7c81583bbe92a07f4fe523ffb63fcbe7ca9218a
   ReactCommon: 4d01bfb533b93a2103329dfefc74db6a9e272888
   ReactNativeDependencies: fa0a54b3f5319ae0e3b9aff32bfee7a424b88e66
   Yoga: 94172d87dd5d83fc929bf1ee53121b5d4490b5f2
 
-PODFILE CHECKSUM: c494d4dd03e88f2faa1c3d436a4979719ba6cee6
+PODFILE CHECKSUM: d3af8a2204b9cbc4b8def552c1dcadb2614cc3a0
 
 COCOAPODS: 1.15.2

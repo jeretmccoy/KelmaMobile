@@ -1,97 +1,93 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Kelma Mobile
 
-# Getting Started
+Kelma is a spiritual fork of AnkiDroid with a shared React Native interface for
+Android and iOS. It remains Anki-compatible by using Anki's Rust backend for
+collections, scheduling, rendering data, imports/exports, and sync.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+This repository is the beginning of that port. It currently contains:
 
-## Step 1: Start Metro
+- a React Native 0.86 TypeScript application for Android and iOS;
+- a typed Turbo Native Module contract for the Rust core;
+- working Android and iOS bridges backed by the same pinned Anki Rust core;
+- a **deck list, reviewer, and sync flow** that open a real collection, draw the
+  next due card from rslib's queue, answer it with rslib's scheduler (SM-2 or
+  FSRS), and sync against [KelmaSync](#sync);
+- architecture and screen-by-screen porting notes in [`docs/`](./docs/).
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+### What is backed by the Rust core
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+Nothing about study behavior is reimplemented in TypeScript. The app calls a
+small set of coarse, rslib-backed operations through `src/core/KelmaCore.ts`:
+
+| Operation | rslib entry point |
+| --- | --- |
+| `openProfile` | `CollectionBuilder::build` |
+| `getDeckTree` | `Collection::deck_tree` |
+| `getNextCard` | `Collection::get_queued_cards` + `render_existing_card` |
+| `answerCard` | `Collection::get_scheduling_states` + `answer_card` |
+| `syncLogin` | `sync::login::sync_login` |
+| `syncCollection` | `Collection::normal_sync` |
+| `fullSync` | `Collection::full_upload` / `full_download` |
+
+On iOS these run through `rust/kelma-core` (the Kelma C ABI over the pinned
+`vendor/anki`). On Android they run through the same rslib via AnkiDroid's
+`rsdroid` backend. Both expose the identical coarse JSON contract.
+
+### Sync
+
+Kelma ships pointed at **KelmaSync**, the self-hosted, Anki-wire-compatible sync
+server (`~/projects/kelma_sync`). The default endpoint lives in
+[`src/config.ts`](./src/config.ts) (`DEFAULT_SYNC_ENDPOINT`). Sign in on the deck
+screen with your KelmaSync credentials; a normal sync runs automatically and the
+app falls back to a full download when the server and device schemas diverge.
+
+
+## Development
+
+Requirements:
+
+- Node.js 22.11 or newer
+- Android Studio/JDK for Android
+- Xcode and CocoaPods for iOS
 
 ```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
-```
-
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
+git submodule update --init --recursive
+npm install
+npm test
+npm run lint
 npm run android
-
-# OR using Yarn
-yarn android
 ```
 
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+For iOS:
 
 ```sh
+cd ios
 bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
 bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
+cd ..
 npm run ios
-
-# OR using Yarn
-yarn ios
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+Both builds use Anki core `25.09.2` at commit `3890e12c9e48`. Android loads it
+through `anki-android-backend` `0.1.64-anki25.09.2`; iOS compiles the pinned
+`vendor/anki` source through `rust/kelma-core`. The first iOS build takes longer
+because Xcode cross-compiles rslib. Later TypeScript changes still use React
+Native Fast Refresh; Rust, Kotlin, Swift, and Objective-C++ changes require a
+native rebuild.
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+## Source baselines
 
-## Step 3: Modify your app
+- AnkiDroid: `~/projects/ankidroid-source`
+- Pinned Anki/rslib: `vendor/anki` (Git submodule)
+- Kelma sync server: `~/projects/kelma_sync`
 
-Now that you have successfully run the app, let's make changes!
+The AnkiDroid and KelmaSync sibling paths are reference checkouts, not runtime
+dependencies. The pinned Anki submodule is part of Kelma's reproducible iOS
+build.
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+## Licensing
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+Kelma is licensed as a whole under AGPL-3.0-or-later. Anki's Rust backend uses
+the same license; compatible third-party components retain their original
+licenses and notices. See [`COPYING`](./COPYING) and
+[`docs/THIRD_PARTY_NOTICES.md`](./docs/THIRD_PARTY_NOTICES.md).
