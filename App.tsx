@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
  * App shell: boots the rslib-backed core, opens the active profile's
- * collection, then hands off to the deck list / reviewer. Navigation is a tiny
- * local state machine — no router dependency needed for two screens.
+ * collection, then hands off to decks, sync, settings, or the reviewer.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -17,9 +16,12 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import { getCoreInfo, openProfile } from './src/core/KelmaCore';
+import { getCoreInfo, openProfile, selectDeck } from './src/core/KelmaCore';
 import { DeckListScreen } from './src/screens/DeckListScreen';
 import { ReviewerScreen } from './src/screens/ReviewerScreen';
+import { SettingsScreen } from './src/screens/SettingsScreen';
+import { StatisticsScreen } from './src/screens/StatisticsScreen';
+import { SyncScreen } from './src/screens/SyncScreen';
 import { palette } from './src/screens/theme';
 
 type Boot =
@@ -27,11 +29,30 @@ type Boot =
   | { kind: 'ready' }
   | { kind: 'error'; reason: string };
 
-type Screen = 'decks' | 'review';
+type MainScreen = 'decks' | 'stats' | 'sync' | 'settings';
+type Screen = { name: MainScreen } | { name: 'review'; deckName: string };
 
 function App() {
   const [boot, setBoot] = useState<Boot>({ kind: 'loading' });
-  const [screen, setScreen] = useState<Screen>('decks');
+  const [screen, setScreen] = useState<Screen>({ name: 'decks' });
+  const [deckReloadToken, setDeckReloadToken] = useState(0);
+  const [autoplayAudio, setAutoplayAudio] = useState(true);
+
+  const openDeck = useCallback((deckId: number, deckName: string) => {
+    // Tap a deck -> review it, like AnkiDroid. Selecting the current deck
+    // drives rslib's queue builder (and includes descendant decks).
+    selectDeck(deckId)
+      .then(() => setScreen({ name: 'review', deckName }))
+      .catch(error =>
+        setBoot({
+          kind: 'error',
+          reason:
+            error instanceof Error
+              ? error.message
+              : 'Could not open that deck.',
+        }),
+      );
+  }, []);
 
   const start = useCallback(() => {
     setBoot({ kind: 'loading' });
@@ -77,18 +98,106 @@ function App() {
         )}
 
         {boot.kind === 'ready' &&
-          (screen === 'decks' ? (
-            <DeckListScreen onStudy={() => setScreen('review')} />
+          (screen.name === 'review' ? (
+            <ReviewerScreen
+              deckName={screen.deckName}
+              autoplayAudio={autoplayAudio}
+              onBack={() => setScreen({ name: 'decks' })}
+            />
           ) : (
-            <ReviewerScreen onBack={() => setScreen('decks')} />
+            <View style={styles.main}>
+              <View
+                style={[
+                  styles.page,
+                  screen.name !== 'decks' && styles.hiddenPage,
+                ]}>
+                <DeckListScreen
+                  onOpenDeck={openDeck}
+                  onOpenSync={() => setScreen({ name: 'sync' })}
+                  onOpenSettings={() => setScreen({ name: 'settings' })}
+                  reloadToken={deckReloadToken}
+                />
+              </View>
+              <View
+                style={[
+                  styles.page,
+                  screen.name !== 'stats' && styles.hiddenPage,
+                ]}>
+                <StatisticsScreen reloadToken={deckReloadToken} />
+              </View>
+              <View
+                style={[
+                  styles.page,
+                  screen.name !== 'sync' && styles.hiddenPage,
+                ]}>
+                <SyncScreen
+                  onSynced={() => setDeckReloadToken(token => token + 1)}
+                />
+              </View>
+              <View
+                style={[
+                  styles.page,
+                  screen.name !== 'settings' && styles.hiddenPage,
+                ]}>
+                <SettingsScreen
+                  autoplayAudio={autoplayAudio}
+                  onAutoplayAudioChange={setAutoplayAudio}
+                />
+              </View>
+              <MainTabBar
+                active={screen.name}
+                onSelect={name => setScreen({ name })}
+              />
+            </View>
           ))}
       </SafeAreaView>
     </SafeAreaProvider>
   );
 }
 
+function MainTabBar({
+  active,
+  onSelect,
+}: {
+  active: MainScreen;
+  onSelect: (screen: MainScreen) => void;
+}) {
+  const tabs: { name: MainScreen; icon: string; label: string }[] = [
+    { name: 'decks', icon: '▤', label: 'Decks' },
+    { name: 'stats', icon: '▦', label: 'Stats' },
+    { name: 'sync', icon: '↻', label: 'Sync' },
+    { name: 'settings', icon: '⚙', label: 'Settings' },
+  ];
+
+  return (
+    <View style={styles.tabBar}>
+      {tabs.map(tab => {
+        const selected = tab.name === active;
+        return (
+          <Pressable
+            key={tab.name}
+            accessibilityRole="tab"
+            accessibilityState={{ selected }}
+            onPress={() => onSelect(tab.name)}
+            style={styles.tab}>
+            <Text style={[styles.tabIcon, selected && styles.tabSelected]}>
+              {tab.icon}
+            </Text>
+            <Text style={[styles.tabLabel, selected && styles.tabSelected]}>
+              {tab.label}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: palette.background },
+  main: { flex: 1 },
+  page: { flex: 1 },
+  hiddenPage: { display: 'none' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 14, paddingHorizontal: 30 },
   muted: { color: palette.textSecondary, fontSize: 14 },
   eyebrow: {
@@ -108,6 +217,23 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   retryText: { color: palette.goldSoft, fontSize: 14, fontWeight: '700' },
+  tabBar: {
+    flexDirection: 'row',
+    minHeight: 62,
+    backgroundColor: palette.surface,
+    borderTopColor: palette.surfaceBorder,
+    borderTopWidth: 1,
+    paddingBottom: 3,
+  },
+  tab: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  tabIcon: { color: palette.textMuted, fontSize: 21, lineHeight: 24 },
+  tabLabel: {
+    color: palette.textMuted,
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  tabSelected: { color: palette.goldSoft },
 });
 
 export default App;

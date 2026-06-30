@@ -30,9 +30,11 @@ export interface Spec extends TurboModule {
 
   /**
    * Run a coarse, rslib-backed operation against the open collection.
-   * `op` is one of: "deckTree", "nextCard", "answerCard", "syncLogin",
-   * "syncCollection", "syncStatus", "fullSync". `request` is JSON (or "" when
-   * the operation takes no argument). Resolves to a JSON string.
+   * `op` is one of: "deckTree", "mediaDir", "setDeck", "nextCard",
+   * "answerCard", "syncLogin", "syncCollection", "syncMedia", "syncStatus",
+   * "fullSync".
+   * `request` is JSON (or "" when the operation takes no argument). Resolves
+   * to a JSON string.
    */
   runCollectionOp(op: string, request: string): Promise<string>;
 }

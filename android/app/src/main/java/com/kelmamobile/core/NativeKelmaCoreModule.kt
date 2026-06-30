@@ -41,6 +41,9 @@ class NativeKelmaCoreModule(
   @Volatile
   private var collectionOpen = false
 
+  @Volatile
+  private var mediaFolder: java.io.File? = null
+
   override fun getCoreInfo(promise: Promise) {
     thread(name = "kelma-rust-core-init") {
       try {
@@ -79,12 +82,14 @@ class NativeKelmaCoreModule(
           backend.closeCollection(false)
           collectionOpen = false
         }
+        val profileMediaFolder = java.io.File(profileDir, "collection.media")
         backend.openCollection(
           java.io.File(profileDir, "collection.anki2").absolutePath,
-          java.io.File(profileDir, "collection.media").absolutePath,
+          profileMediaFolder.absolutePath,
           java.io.File(profileDir, "collection.media.db2").absolutePath,
           "",
         )
+        mediaFolder = profileMediaFolder
         collectionOpen = true
         promise.resolve("{\"opened\":true}")
       } catch (error: Throwable) {
@@ -123,6 +128,7 @@ class NativeKelmaCoreModule(
           "answerCard" -> answerCard(backend, json)
           "syncLogin" -> syncLogin(backend, json)
           "syncCollection" -> syncCollection(backend, json)
+          "syncMedia" -> syncMedia(backend, json)
           "syncStatus" -> syncStatus(backend)
           "fullSync" -> fullSync(backend, json)
           else -> throw IllegalArgumentException("unknown session operation '$op'")
@@ -272,6 +278,23 @@ class NativeKelmaCoreModule(
 
   private fun syncStatus(backend: Backend): String {
     return JSONObject().put("changes", "unknown").toString()
+  }
+
+  private fun syncMedia(backend: Backend, json: JSONObject): String {
+    val auth = anki.sync.SyncAuth.newBuilder()
+      .setHkey(json.getString("hkey"))
+      .setEndpoint(json.getString("endpoint"))
+      .build()
+    backend.syncMedia(auth)
+    while (backend.mediaSyncStatus().active) {
+      Thread.sleep(100)
+    }
+
+    val files = mediaFolder?.listFiles()?.filter { it.isFile }.orEmpty()
+    return JSONObject()
+      .put("files", files.size)
+      .put("bytes", files.sumOf { it.length() })
+      .toString()
   }
 
   private fun fullSync(backend: Backend, json: JSONObject): String {

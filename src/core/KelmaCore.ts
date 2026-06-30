@@ -31,6 +31,8 @@ export type ReviewCard = {
   question: string;
   answer: string;
   css: string;
+  /** Next-interval labels for the rating buttons: [again, hard, good, easy]. */
+  intervals: string[];
 };
 
 export type NextCard = {
@@ -139,7 +141,42 @@ export async function getDeckTree(): Promise<DeckNode> {
   return runOp<DeckNode>('deckTree');
 }
 
+/** Absolute path of the collection's media folder (for resolving audio files). */
+export async function getMediaDir(): Promise<string> {
+  return (await runOp<{ dir: string }>('mediaDir')).dir;
+}
+
+// --- Statistics --------------------------------------------------------------
+
+export type CardCounts = {
+  total: number;
+  new: number;
+  learning: number;
+  young: number;
+  mature: number;
+  suspended: number;
+};
+
+export type Stats = {
+  /** Localised "Studied N cards in M minutes today" message from rslib. */
+  studiedToday: string;
+  counts: CardCounts;
+};
+
+export async function getStats(): Promise<Stats> {
+  return runOp<Stats>('stats');
+}
+
 // --- Review / scheduling -----------------------------------------------------
+
+/**
+ * Set the deck that `getNextCard` pulls from (rslib's "current deck").
+ * Descendant decks are included automatically, exactly like tapping a deck in
+ * AnkiDroid to start its review session.
+ */
+export async function selectDeck(deckId: number): Promise<void> {
+  await runOp('setDeck', { deckId });
+}
 
 export async function getNextCard(): Promise<NextCard> {
   return runOp<NextCard>('nextCard');
@@ -170,6 +207,15 @@ export async function syncLogin(
 
 export async function syncCollection(auth: SyncAuth): Promise<SyncOutcome> {
   return runOp<SyncOutcome>('syncCollection', auth);
+}
+
+export type MediaSyncResult = {
+  files: number;
+  bytes: number;
+};
+
+export async function syncMedia(auth: SyncAuth): Promise<MediaSyncResult> {
+  return runOp<MediaSyncResult>('syncMedia', auth);
 }
 
 export async function fullSync(

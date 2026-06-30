@@ -22,11 +22,14 @@ import {
   answerCard,
   fullSync,
   getDeckTree,
+  getMediaDir,
   getNextCard,
   openProfile,
   Rating,
+  selectDeck,
   syncCollection,
   syncLogin,
+  syncMedia,
 } from './KelmaCore';
 import { DEFAULT_SYNC_ENDPOINT } from '../config';
 
@@ -91,6 +94,21 @@ describe('review + scheduling', () => {
     expect(native.runCollectionOp).toHaveBeenCalledWith('deckTree', '');
     expect(tree.name).toBe('Default');
   });
+
+  it('sets the current deck before review', async () => {
+    await selectDeck(42);
+    expect(native.runCollectionOp).toHaveBeenCalledWith(
+      'setDeck',
+      JSON.stringify({ deckId: 42 }),
+    );
+  });
+
+  it('exposes the collection media directory for audio playback', async () => {
+    native.runCollectionOp.mockResolvedValueOnce(JSON.stringify({ dir: '/data/media' }));
+    const dir = await getMediaDir();
+    expect(native.runCollectionOp).toHaveBeenCalledWith('mediaDir', '');
+    expect(dir).toBe('/data/media');
+  });
 });
 
 describe('sync defaults to KelmaSync', () => {
@@ -118,6 +136,21 @@ describe('sync defaults to KelmaSync', () => {
     );
     const outcome = await syncCollection({ hkey: 'abc', endpoint: DEFAULT_SYNC_ENDPOINT });
     expect(outcome.required).toBe('noChanges');
+  });
+
+  it('reports media totals separately from collection sync', async () => {
+    native.runCollectionOp.mockResolvedValueOnce(
+      JSON.stringify({ files: 123, bytes: 456789 }),
+    );
+    const result = await syncMedia({
+      hkey: 'abc',
+      endpoint: DEFAULT_SYNC_ENDPOINT,
+    });
+    expect(native.runCollectionOp).toHaveBeenCalledWith(
+      'syncMedia',
+      JSON.stringify({ hkey: 'abc', endpoint: DEFAULT_SYNC_ENDPOINT }),
+    );
+    expect(result).toEqual({ files: 123, bytes: 456789 });
   });
 
   it('encodes the direction for a full sync', async () => {

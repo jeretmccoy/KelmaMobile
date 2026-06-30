@@ -1,6 +1,6 @@
 /**
- * Deck list + sync. Lists the collection's decks (with today's counts) and
- * provides KelmaSync sign-in and one-tap sync. Everything is rslib-backed.
+ * Deck browser (AnkiDroid-style): the deck tree with per-deck New / Learning /
+ * Due counts and collapsible subdecks. Tapping a deck starts its review.
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
@@ -13,62 +13,104 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from 'react-native';
-import { DEFAULT_SYNC_ENDPOINT } from '../config';
-import {
-  fullSync,
-  getDeckTree,
-  syncCollection,
-  syncLogin,
-  type DeckNode,
-  type SyncAuth,
-} from '../core/KelmaCore';
+import { getDeckTree, type DeckNode } from '../core/KelmaCore';
 import { palette } from './theme';
 
 type Props = {
-  onStudy: () => void;
+  onOpenDeck: (deckId: number, deckName: string) => void;
+  onOpenSync: () => void;
+  onOpenSettings: () => void;
+  reloadToken: number;
 };
 
-type FlatDeck = { id: number; name: string; depth: number; due: number };
+type Row = {
+  id: number;
+  name: string;
+  depth: number;
+  hasChildren: boolean;
+  newCount: number;
+  learnCount: number;
+  reviewCount: number;
+};
 
-function flatten(node: DeckNode, depth = -1, acc: FlatDeck[] = []): FlatDeck[] {
-  // The synthetic root (depth -1) is skipped; its children are the real decks.
+/** Walk the tree into visible rows, skipping children of collapsed decks. */
+function flatten(
+  node: DeckNode,
+  collapsed: Set<number>,
+  depth = -1,
+  acc: Row[] = [],
+): Row[] {
   if (depth >= 0) {
     acc.push({
       id: node.deckId,
       name: node.name,
       depth,
-      due: node.newCount + node.learnCount + node.reviewCount,
+      hasChildren: node.children.length > 0,
+      newCount: node.newCount,
+      learnCount: node.learnCount,
+      reviewCount: node.reviewCount,
     });
   }
-  for (const child of node.children) {
-    flatten(child, depth + 1, acc);
+  const isCollapsed = depth >= 0 && collapsed.has(node.deckId);
+  if (!isCollapsed) {
+    for (const child of node.children) {
+      flatten(child, collapsed, depth + 1, acc);
+    }
   }
   return acc;
 }
 
-export function DeckListScreen({ onStudy }: Props) {
-  const [decks, setDecks] = useState<FlatDeck[] | null>(null);
+/** Seed collapse state from rslib's stored per-deck collapsed flags. */
+function initialCollapsed(node: DeckNode, acc = new Set<number>()): Set<number> {
+  if (node.collapsed && node.children.length > 0) {
+    acc.add(node.deckId);
+  }
+  for (const child of node.children) {
+    initialCollapsed(child, acc);
+  }
+  return acc;
+}
+
+export function DeckListScreen({
+  onOpenDeck,
+  onOpenSync,
+  onOpenSettings,
+  reloadToken,
+}: Props) {
+  const [tree, setTree] = useState<DeckNode | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(() => {
     setError(null);
     return getDeckTree()
-      .then(tree => setDecks(flatten(tree)))
+      .then(t => {
+        setTree(t);
+        setCollapsed(initialCollapsed(t));
+      })
       .catch(e => setError(e instanceof Error ? e.message : 'Could not load decks.'));
   }, []);
 
   useEffect(() => {
     load();
-  }, [load]);
+  }, [load, reloadToken]);
 
   const onRefresh = () => {
     setRefreshing(true);
     load().finally(() => setRefreshing(false));
   };
+
+  const toggle = (deckId: number) =>
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      next.has(deckId) ? next.delete(deckId) : next.add(deckId);
+      return next;
+    });
+
+  const rows = tree ? flatten(tree, collapsed) : null;
 
   return (
     <ScrollView
@@ -77,10 +119,32 @@ export function DeckListScreen({ onStudy }: Props) {
       refreshControl={
         <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={palette.gold} />
       }>
-      <Text style={styles.eyebrow}>KELMA</Text>
-      <Text style={styles.title}>Your decks</Text>
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.eyebrow}>KELMA</Text>
+          <Text style={styles.title}>Your decks</Text>
+        </View>
+        <View style={styles.headerActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Sync"
+            onPress={onOpenSync}
+            style={styles.headerButton}>
+            <Text style={styles.headerIcon}>↻</Text>
+            <Text style={styles.headerButtonText}>Sync</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+            onPress={onOpenSettings}
+            style={styles.headerButton}>
+            <Text style={styles.headerIcon}>⚙</Text>
+            <Text style={styles.headerButtonText}>Settings</Text>
+          </Pressable>
+        </View>
+      </View>
 
-      {decks === null && !error && (
+      {rows === null && !error && (
         <View style={styles.center}>
           <ActivityIndicator color={palette.gold} />
         </View>
@@ -88,194 +152,112 @@ export function DeckListScreen({ onStudy }: Props) {
 
       {error && <Text style={styles.error}>{error}</Text>}
 
-      {decks?.length === 0 && (
+      {rows?.length === 0 && (
         <Text style={styles.empty}>
-          No decks yet. Sign in below and sync to pull your collection from
-          KelmaSync.
+          No decks yet. Tap Sync above to pull your collection from KelmaSync.
         </Text>
       )}
 
-      {decks?.map(deck => (
-        <View key={deck.id} style={[styles.deckRow, { paddingLeft: 4 + deck.depth * 16 }]}>
-          <Text style={styles.deckName} numberOfLines={1}>
-            {deck.name}
-          </Text>
-          <Text style={[styles.deckDue, deck.due === 0 && styles.deckDueZero]}>
-            {deck.due}
-          </Text>
+      {rows && rows.length > 0 && (
+        <View style={styles.columnHeader}>
+          <View style={styles.deckNameCol} />
+          <Text style={[styles.colLabel, styles.colNew]}>New</Text>
+          <Text style={[styles.colLabel, styles.colLearn]}>Learn</Text>
+          <Text style={[styles.colLabel, styles.colReview]}>Due</Text>
         </View>
+      )}
+
+      {rows?.map(deck => (
+        <Pressable
+          key={deck.id}
+          onPress={() => onOpenDeck(deck.id, deck.name)}
+          style={({ pressed }) => [styles.deckRow, pressed && styles.deckRowPressed]}
+          android_ripple={{ color: palette.surfaceBorder, radius: 0 }}>
+          <View style={[styles.deckNameCol, { paddingLeft: deck.depth * 16 }]}>
+            {deck.hasChildren ? (
+              <Pressable
+                onPress={() => toggle(deck.id)}
+                hitSlop={10}
+                style={styles.chevronHit}
+                accessibilityRole="button"
+                accessibilityLabel={collapsed.has(deck.id) ? 'Expand' : 'Collapse'}>
+                <Text style={styles.chevron}>{collapsed.has(deck.id) ? '▸' : '▾'}</Text>
+              </Pressable>
+            ) : (
+              <View style={styles.chevronHit} />
+            )}
+            <Text style={styles.deckName} numberOfLines={1}>
+              {deck.name}
+            </Text>
+          </View>
+          <Text style={[styles.count, styles.colNew, deck.newCount === 0 && styles.zero]}>
+            {deck.newCount}
+          </Text>
+          <Text style={[styles.count, styles.colLearn, deck.learnCount === 0 && styles.zero]}>
+            {deck.learnCount}
+          </Text>
+          <Text style={[styles.count, styles.colReview, deck.reviewCount === 0 && styles.zero]}>
+            {deck.reviewCount}
+          </Text>
+        </Pressable>
       ))}
-
-      <Pressable onPress={onStudy} style={styles.studyButton}>
-        <Text style={styles.studyText}>Study now</Text>
-      </Pressable>
-
-      <SyncPanel onSynced={load} />
     </ScrollView>
   );
 }
 
-function SyncPanel({ onSynced }: { onSynced: () => void }) {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [auth, setAuth] = useState<SyncAuth | null>(null);
-  const [status, setStatus] = useState<string>('Sign in to your KelmaSync account.');
-  const [busy, setBusy] = useState(false);
-
-  const runSync = useCallback(
-    async (credentials: SyncAuth) => {
-      const outcome = await syncCollection(credentials);
-      if (outcome.required === 'fullSyncRequired') {
-        // The server and device diverged. Default to download so a fresh device
-        // pulls the server's collection; the UI can later prompt for direction.
-        setStatus('Schemas differ — performing a full download…');
-        await fullSync(credentials, outcome.downloadOk ? false : true);
-        setStatus('Full sync complete.');
-      } else if (outcome.required === 'noChanges') {
-        setStatus('Already up to date.');
-      } else {
-        setStatus('Sync complete.');
-      }
-      onSynced();
-    },
-    [onSynced],
-  );
-
-  const onSignInAndSync = () => {
-    setBusy(true);
-    setStatus('Signing in…');
-    syncLogin(username, password, DEFAULT_SYNC_ENDPOINT)
-      .then(credentials => {
-        setAuth(credentials);
-        setStatus('Signed in. Syncing…');
-        return runSync(credentials);
-      })
-      .catch(e => setStatus(e instanceof Error ? e.message : 'Sync failed.'))
-      .finally(() => setBusy(false));
-  };
-
-  const onSyncAgain = () => {
-    if (!auth) {
-      return;
-    }
-    setBusy(true);
-    setStatus('Syncing…');
-    runSync(auth)
-      .catch(e => setStatus(e instanceof Error ? e.message : 'Sync failed.'))
-      .finally(() => setBusy(false));
-  };
-
-  return (
-    <View style={styles.syncCard}>
-      <Text style={styles.syncTitle}>Sync</Text>
-      <Text style={styles.syncEndpoint}>{DEFAULT_SYNC_ENDPOINT}</Text>
-
-      {!auth && (
-        <>
-          <TextInput
-            style={styles.input}
-            placeholder="Username or email"
-            placeholderTextColor={palette.textMuted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            value={username}
-            onChangeText={setUsername}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Password"
-            placeholderTextColor={palette.textMuted}
-            secureTextEntry
-            value={password}
-            onChangeText={setPassword}
-          />
-        </>
-      )}
-
-      <Pressable
-        disabled={busy}
-        onPress={auth ? onSyncAgain : onSignInAndSync}
-        style={[styles.syncButton, busy && styles.syncButtonDisabled]}>
-        {busy ? (
-          <ActivityIndicator color={palette.background} />
-        ) : (
-          <Text style={styles.syncButtonText}>{auth ? 'Sync now' : 'Sign in & sync'}</Text>
-        )}
-      </Pressable>
-
-      <Text style={styles.syncStatus}>{status}</Text>
-    </View>
-  );
-}
+const COL_W = 46;
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: palette.background },
   content: { paddingHorizontal: 24, paddingTop: 36, paddingBottom: 40 },
-  eyebrow: {
-    color: palette.gold,
-    fontSize: 13,
-    fontWeight: '800',
-    letterSpacing: 3.2,
-    marginBottom: 10,
-  },
-  title: {
-    color: palette.textPrimary,
-    fontSize: 34,
-    fontWeight: '700',
-    letterSpacing: -1,
+  eyebrow: { color: palette.gold, fontSize: 13, fontWeight: '800', letterSpacing: 3.2, marginBottom: 10 },
+  title: { color: palette.textPrimary, fontSize: 34, fontWeight: '700', letterSpacing: -1 },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
     marginBottom: 20,
   },
-  center: { paddingVertical: 30, alignItems: 'center' },
-  error: { color: palette.bad, fontSize: 14, marginBottom: 12 },
-  empty: { color: palette.textSecondary, fontSize: 15, lineHeight: 22, marginBottom: 8 },
-  deckRow: {
-    flexDirection: 'row',
+  headerActions: { flexDirection: 'row', gap: 8 },
+  headerButton: {
+    minWidth: 58,
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 14,
-    borderBottomColor: palette.surfaceBorder,
-    borderBottomWidth: 1,
-  },
-  deckName: { color: palette.textPrimary, fontSize: 16, flex: 1, marginRight: 12 },
-  deckDue: { color: palette.good, fontSize: 16, fontWeight: '700' },
-  deckDueZero: { color: palette.textMuted, fontWeight: '400' },
-  studyButton: {
-    backgroundColor: palette.gold,
-    borderRadius: 14,
-    paddingVertical: 16,
-    alignItems: 'center',
-    marginTop: 24,
-  },
-  studyText: { color: palette.background, fontSize: 16, fontWeight: '800' },
-  syncCard: {
-    marginTop: 30,
+    paddingHorizontal: 7,
+    paddingVertical: 7,
+    borderRadius: 10,
     backgroundColor: palette.surface,
     borderColor: palette.surfaceBorder,
     borderWidth: 1,
-    borderRadius: 18,
-    padding: 20,
   },
-  syncTitle: { color: palette.textPrimary, fontSize: 18, fontWeight: '700' },
-  syncEndpoint: { color: palette.textMuted, fontSize: 12, marginTop: 4, marginBottom: 16 },
-  input: {
-    backgroundColor: palette.background,
-    borderColor: palette.surfaceBorder,
-    borderWidth: 1,
-    borderRadius: 10,
-    color: palette.textPrimary,
-    fontSize: 15,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    marginBottom: 12,
-  },
-  syncButton: {
-    backgroundColor: palette.goldSoft,
-    borderRadius: 12,
-    paddingVertical: 14,
+  headerIcon: { color: palette.goldSoft, fontSize: 19, lineHeight: 22 },
+  headerButtonText: { color: palette.textSecondary, fontSize: 10, fontWeight: '700', marginTop: 2 },
+  center: { paddingVertical: 30, alignItems: 'center' },
+  error: { color: palette.bad, fontSize: 14, marginBottom: 12 },
+  empty: { color: palette.textSecondary, fontSize: 15, lineHeight: 22, marginBottom: 8 },
+  columnHeader: {
+    flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 4,
+    paddingBottom: 6,
+    borderBottomColor: palette.surfaceBorder,
+    borderBottomWidth: 1,
   },
-  syncButtonDisabled: { opacity: 0.6 },
-  syncButtonText: { color: palette.background, fontSize: 15, fontWeight: '800' },
-  syncStatus: { color: palette.textSecondary, fontSize: 13, marginTop: 12, textAlign: 'center' },
+  colLabel: { width: COL_W, textAlign: 'center', fontSize: 11, fontWeight: '700' },
+  deckRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 15,
+    borderBottomColor: palette.surfaceBorder,
+    borderBottomWidth: 1,
+  },
+  deckRowPressed: { backgroundColor: palette.surfaceBorder },
+  deckNameCol: { flex: 1, flexDirection: 'row', alignItems: 'center', marginRight: 8 },
+  chevronHit: { width: 22, alignItems: 'center' },
+  chevron: { color: palette.textMuted, fontSize: 14 },
+  deckName: { color: palette.textPrimary, fontSize: 16, flex: 1 },
+  count: { width: COL_W, textAlign: 'center', fontSize: 16, fontWeight: '700' },
+  colNew: { color: '#6f9fb0' },
+  colLearn: { color: palette.bad },
+  colReview: { color: palette.good },
+  zero: { color: palette.textMuted, fontWeight: '400' },
 });

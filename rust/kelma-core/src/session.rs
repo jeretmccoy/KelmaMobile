@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use anki::card::CardId;
 use anki::collection::{Collection, CollectionBuilder};
+use anki::decks::DeckId;
 use anki::prelude::AnkiError;
 use anki::scheduler::answering::{CardAnswer, Rating};
 use anki::scheduler::states::SchedulingStates;
@@ -89,6 +90,23 @@ impl KelmaSession {
         Ok(deck_node_to_json(&node))
     }
 
+    /// Absolute path of the collection's media folder, so the platform layer
+    /// can resolve `[sound:resource]` tags to on-disk files for playback.
+    pub fn media_dir(&self) -> Result<Value, String> {
+        let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        Ok(json!({ "dir": guard.media_folder_path }))
+    }
+
+    /// Set the deck that subsequent review pulls cards from. rslib's notion of
+    /// the "current deck" drives the queue builder, and descendants are pulled
+    /// in automatically, mirroring how AnkiDroid starts a review from a tapped
+    /// deck. `request` is `{deckId}`.
+    pub fn set_current_deck(&self, request: &Value) -> Result<Value, String> {
+        let deck_id = DeckId(i64_field(request, "deckId")?);
+        self.with_col(|col| col.set_current_deck(deck_id))?;
+        Ok(json!({ "selected": true, "deckId": deck_id.0 }))
+    }
+
     /// The next due card (rendered) plus remaining counts. Returns
     /// `{counts:{new,learning,review}, card: null | {...}}`.
     pub fn next_card(&self) -> Result<Value, String> {
@@ -114,6 +132,10 @@ impl KelmaSession {
                 .map(|d| d.name.human_name())
                 .unwrap_or_default();
 
+            // Next-interval labels for the rating buttons, like normal Anki:
+            // [again, hard, good, easy] (e.g. "<1m", "10m", "1d", "4d").
+            let states = col.get_scheduling_states(card_id)?;
+            let intervals = col.describe_next_states(&states)?;
 
             Ok(json!({
                 "counts": counts,
@@ -123,6 +145,7 @@ impl KelmaSession {
                     "question": rendered.question().into_owned(),
                     "answer": rendered.answer().into_owned(),
                     "css": rendered.css,
+                    "intervals": intervals,
                 },
             }))
         })
@@ -162,6 +185,30 @@ impl KelmaSession {
         })?;
 
         Ok(json!({ "answered": true }))
+    }
+
+    /// Collection statistics for the Stats screen: today's study message plus a
+    /// card-count breakdown (computed via searches, like AnkiDroid's card stats).
+    pub fn stats(&self) -> Result<Value, String> {
+        self.with_col(|col| {
+            let studied = col.studied_today().unwrap_or_default();
+            let count = |c: &mut anki::collection::Collection, query: &str| -> i64 {
+                c.search_cards(query, anki::search::SortMode::NoOrder)
+                    .map(|cards| cards.len() as i64)
+                    .unwrap_or(0)
+            };
+            Ok(json!({
+                "studiedToday": studied,
+                "counts": {
+                    "total": count(col, "deck:*"),
+                    "new": count(col, "is:new"),
+                    "learning": count(col, "is:learn"),
+                    "young": count(col, "is:review -prop:ivl>=21"),
+                    "mature": count(col, "prop:ivl>=21"),
+                    "suspended": count(col, "is:suspended"),
+                },
+            }))
+        })
     }
 
     /// Exchange username/password for a sync host key against the given
@@ -254,6 +301,48 @@ impl KelmaSession {
 
         Ok(json!({ "completed": true, "upload": upload }))
     }
+
+    /// Run Anki's separate media protocol after collection sync. Keeping this
+    /// as its own bridge operation lets the React Native UI report the real
+    /// collection and media phases independently.
+    pub fn sync_media(&self, request: &Value) -> Result<Value, String> {
+        let auth = sync_auth_from(request)?;
+        let result = self.with_col(|col| {
+            let manager = col.media()?;
+            let progress = col.new_progress_handler();
+            block_on(manager.sync_media(progress, auth, web_client(), None))
+        });
+
+        if let Err(error) = result {
+            let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+            let (files, bytes) =
+                media_folder_totals(&guard.media_folder_path).unwrap_or_default();
+            return Err(format!(
+                "Media sync stopped after {files} files ({bytes} bytes): {error}"
+            ));
+        }
+
+        let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let (files, bytes) = media_folder_totals(&guard.media_folder_path)?;
+        Ok(json!({ "files": files, "bytes": bytes }))
+    }
+}
+
+fn media_folder_totals(path: &str) -> Result<(u64, u64), String> {
+    let entries = std::fs::read_dir(path).map_err(|e| format!("reading media folder: {e}"))?;
+    let mut files = 0;
+    let mut bytes = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("reading media entry: {e}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("reading media metadata: {e}"))?;
+        if metadata.is_file() {
+            files += 1;
+            bytes += metadata.len();
+        }
+    }
+    Ok((files, bytes))
 }
 
 fn build_collection(

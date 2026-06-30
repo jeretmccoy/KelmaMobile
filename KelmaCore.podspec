@@ -18,7 +18,10 @@ Pod::Spec.new do |spec|
 
   spec.dependency 'React-Core'
   spec.dependency 'ReactCodegen'
-  spec.frameworks = 'Security', 'SystemConfiguration'
+  # react-native-sound 0.13 uses AVAudioSession but does not declare
+  # AVFoundation in its own podspec. Keep the app-level framework link
+  # persistent here instead of patching generated node_modules content.
+  spec.frameworks = 'AVFoundation', 'AudioToolbox', 'Security', 'SystemConfiguration'
   spec.libraries = 'c++', 'z'
   spec.pod_target_xcconfig = {
     'HEADER_SEARCH_PATHS' => '$(inherited) "$(PODS_TARGET_SRCROOT)/rust/kelma-core/include"',
@@ -37,6 +40,8 @@ Pod::Spec.new do |spec|
       '${PODS_TARGET_SRCROOT}/rust/kelma-core/Cargo.toml',
       '${PODS_TARGET_SRCROOT}/rust/kelma-core/Cargo.lock',
       '${PODS_TARGET_SRCROOT}/rust/kelma-core/src/lib.rs',
+      '${PODS_TARGET_SRCROOT}/rust/kelma-core/src/session.rs',
+      '${PODS_TARGET_SRCROOT}/vendor/anki/rslib/src/media/files.rs',
     ],
     :output_files => [
       rust_archive,

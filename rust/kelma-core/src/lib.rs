@@ -325,10 +325,14 @@ fn dispatch_session(session: &KelmaSession, op: &str, input: &[u8]) -> Result<St
 
     let value = match op {
         "deckTree" => session.deck_tree()?,
+        "mediaDir" => session.media_dir()?,
+        "setDeck" => session.set_current_deck(&request)?,
         "nextCard" => session.next_card()?,
         "answerCard" => session.answer_card(&request)?,
+        "stats" => session.stats()?,
         "syncLogin" => session.sync_login(&request)?,
         "syncCollection" => session.sync_collection(&request)?,
+        "syncMedia" => session.sync_media(&request)?,
         "syncStatus" => session.sync_status()?,
         "fullSync" => session.full_sync(&request)?,
         other => return Err(format!("unknown session operation '{other}'")),
