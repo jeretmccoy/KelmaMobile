@@ -16,7 +16,9 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import { getCoreInfo, openProfile, selectDeck } from './src/core/KelmaCore';
+import { getCoreInfo, getStoredSyncAuth, openProfile, runSyncNow, selectDeck, storeSyncAuth, type SyncAuth } from './src/core/KelmaCore';
+import { CardDetailScreen } from './src/screens/CardDetailScreen';
+import { DeckInspectorScreen } from './src/screens/DeckInspectorScreen';
 import { DeckListScreen } from './src/screens/DeckListScreen';
 import { ReviewerScreen } from './src/screens/ReviewerScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
@@ -30,7 +32,11 @@ type Boot =
   | { kind: 'error'; reason: string };
 
 type MainScreen = 'decks' | 'stats' | 'sync' | 'settings';
-type Screen = { name: MainScreen } | { name: 'review'; deckName: string };
+type Screen =
+  | { name: MainScreen }
+  | { name: 'review'; deckId: number; deckName: string }
+  | { name: 'deckInspector'; deckId: number; deckName: string }
+  | { name: 'cardDetail'; cardId: number; deckId: number; deckName: string };
 
 function App() {
   const [boot, setBoot] = useState<Boot>({ kind: 'loading' });
@@ -38,11 +44,52 @@ function App() {
   const [deckReloadToken, setDeckReloadToken] = useState(0);
   const [autoplayAudio, setAutoplayAudio] = useState(true);
 
+  // Persisted KelmaSync credentials, so the home Sync button can sync without
+  // re-prompting for a login. Loaded from the collection's config store after
+  // the collection opens; updated by SyncScreen on a successful sign-in.
+  const [syncAuth, setSyncAuth] = useState<SyncAuth | null>(null);
+  const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'error' | 'done'>('idle');
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
+
+  // Run an incremental sync (collection + media) using the stored credentials.
+  // If the user has never signed in, fall through to the Sync/Account screen
+  // instead. Bumps the deck reload token so badges refresh afterwards.
+  const syncNow = useCallback(() => {
+    if (!syncAuth) {
+      setScreen({ name: 'sync' });
+      return;
+    }
+    setSyncState('syncing');
+    setSyncStatus('Syncing collection and media…');
+    runSyncNow(syncAuth)
+      .then(summary => {
+        setSyncState('done');
+        setSyncStatus(summary);
+        setDeckReloadToken(token => token + 1);
+      })
+      .catch(error => {
+        setSyncState('error');
+        setSyncStatus(error instanceof Error ? error.message : 'Sync failed.');
+      });
+  }, [syncAuth]);
+
+  const onSignedIn = useCallback((auth: SyncAuth) => {
+    setSyncAuth(auth);
+    storeSyncAuth(auth).catch(() => {
+      // best-effort persistence; in-memory auth still works for this session
+    });
+  }, []);
+
+  // Tap a deck -> open its inspector (overview + browse), the AnkiDroid
+  // StudyOptions + Card Browser equivalent. Selecting the deck for review and
+  // jumping into the reviewer happens from the inspector's Study button.
   const openDeck = useCallback((deckId: number, deckName: string) => {
-    // Tap a deck -> review it, like AnkiDroid. Selecting the current deck
-    // drives rslib's queue builder (and includes descendant decks).
+    setScreen({ name: 'deckInspector', deckId, deckName });
+  }, []);
+
+  const startReview = useCallback((deckId: number, deckName: string) => {
     selectDeck(deckId)
-      .then(() => setScreen({ name: 'review', deckName }))
+      .then(() => setScreen({ name: 'review', deckId, deckName }))
       .catch(error =>
         setBoot({
           kind: 'error',
@@ -62,6 +109,7 @@ function App() {
     getCoreInfo()
       .then(() => openProfile())
       .then(() => setBoot({ kind: 'ready' }))
+      .then(() => getStoredSyncAuth().then(setSyncAuth).catch(() => {}))
       .catch(error =>
         setBoot({
           kind: 'error',
@@ -102,7 +150,38 @@ function App() {
             <ReviewerScreen
               deckName={screen.deckName}
               autoplayAudio={autoplayAudio}
+              onBack={() => {
+                setScreen({ name: 'deckInspector', deckId: screen.deckId, deckName: screen.deckName });
+                setDeckReloadToken(token => token + 1);
+              }}
+            />
+          ) : screen.name === 'deckInspector' ? (
+            <DeckInspectorScreen
+              deckId={screen.deckId}
+              deckName={screen.deckName}
+              onStudy={() => startReview(screen.deckId, screen.deckName)}
+              onOpenCard={cardId =>
+                setScreen({
+                  name: 'cardDetail',
+                  cardId,
+                  deckId: screen.deckId,
+                  deckName: screen.deckName,
+                })
+              }
               onBack={() => setScreen({ name: 'decks' })}
+              reloadToken={deckReloadToken}
+            />
+          ) : screen.name === 'cardDetail' ? (
+            <CardDetailScreen
+              cardId={screen.cardId}
+              deckName={screen.deckName}
+              onBack={() =>
+                setScreen({
+                  name: 'deckInspector',
+                  deckId: screen.deckId,
+                  deckName: screen.deckName,
+                })
+              }
             />
           ) : (
             <View style={styles.main}>
@@ -113,9 +192,12 @@ function App() {
                 ]}>
                 <DeckListScreen
                   onOpenDeck={openDeck}
+                  onSyncNow={syncNow}
                   onOpenSync={() => setScreen({ name: 'sync' })}
                   onOpenSettings={() => setScreen({ name: 'settings' })}
                   reloadToken={deckReloadToken}
+                  syncState={syncState}
+                  syncStatus={syncStatus}
                 />
               </View>
               <View
@@ -132,6 +214,7 @@ function App() {
                 ]}>
                 <SyncScreen
                   onSynced={() => setDeckReloadToken(token => token + 1)}
+                  onSignedIn={onSignedIn}
                 />
               </View>
               <View

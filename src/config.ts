@@ -8,9 +8,12 @@
  * Anki-wire-compatible sync server. Anki clients append `/sync/*` and
  * `/msync/*` to this base URL, so it must be the gateway root.
  *
+ * This must be reachable from the device running Kelma Mobile — on a physical
+ * phone, `127.0.0.1` means the phone itself, so use the host machine's LAN IP
+ * (and keep the phone on the same Wi-Fi network as the KelmaSync server).
  * Override per-user once a settings screen exists.
  */
-export const DEFAULT_SYNC_ENDPOINT = 'http://127.0.0.1:8080';
+export const DEFAULT_SYNC_ENDPOINT = 'http://192.168.1.225:8080';
 
 
 /**

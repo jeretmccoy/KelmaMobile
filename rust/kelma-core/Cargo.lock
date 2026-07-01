@@ -2811,6 +2811,7 @@ dependencies = [
  "anki_proto",
  "prost",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tokio",
  "url",

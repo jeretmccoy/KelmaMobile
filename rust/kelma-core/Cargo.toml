@@ -12,6 +12,7 @@ crate-type = ["staticlib"]
 anki = { path = "../../vendor/anki/rslib", features = ["rustls"] }
 anki_proto = { path = "../../vendor/anki/rslib/proto" }
 prost = "0.13"
+rusqlite = { version = "0.36.0", features = ["bundled"] }
 serde_json = "1"
 url = "2"
 # NOTE: `reqwest` and `tokio` must resolve to the exact versions rslib links

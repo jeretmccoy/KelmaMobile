@@ -16,11 +16,12 @@ is newer than the packaged core and must not be linked into only one platform.
 |---|---|---|---|
 | Foundation | `CollectionManager`, `libanki`, `rsdroid` | Typed TurboModule and shared core lifecycle | Android and iOS working |
 | Collection + decks | `DeckPicker`, `CollectionManager` | Open/create collection, deck tree and counts | Next |
+| Deck inspector | `StudyOptionsFragment`, `CardBrowser` (deck-scoped) | Per-deck overview + paged card browser | Done |
 | Reviewer | `reviewer/`, `AbstractFlashcardViewer` | Shared reviewer shell, WebView card, answer actions | Pending |
 | Editor | `NoteEditor`, multimedia fields | Shared note editor with platform media pickers | Pending |
-| Sync | sync screens + backend sync calls | rslib sync against KelmaSync with progress UI | Pending |
+| Sync | sync screens + backend sync calls | rslib sync against KelmaSync with progress UI; persisted credentials + home Sync button; per-deck pending badges | Done (incremental) |
 | Import/export | `ImportUtils`, sharing flows | `.apkg`/`.colpkg` through rslib | Pending |
-| Browser | card browser/search | rslib search grammar and paged results | Pending |
+| Browser | card browser/search | rslib search grammar and paged results | Done (deck-scoped) |
 | Settings | preferences | Shared settings plus small platform sections | Pending |
 | Notifications | `NotificationService` | Native scheduled review reminders | Pending |
 | Widgets/shortcuts | Android widgets and intents | Platform-specific thin entry points | Pending |

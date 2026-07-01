@@ -26,7 +26,7 @@ import { SyncScreen } from './SyncScreen';
 test('shows collection and media progress with final on-disk totals', async () => {
   let renderer!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
-    renderer = ReactTestRenderer.create(<SyncScreen onSynced={jest.fn()} />);
+    renderer = ReactTestRenderer.create(<SyncScreen onSynced={jest.fn()} onSignedIn={jest.fn()} />);
   });
 
   await ReactTestRenderer.act(async () => {

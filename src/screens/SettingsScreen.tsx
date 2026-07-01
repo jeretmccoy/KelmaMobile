@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-import { ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { useEffect, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { SYNC_CLIENT_VERSION } from '../config';
+import { getSyncDebug, type SyncDebug } from '../core/KelmaCore';
 import { palette } from './theme';
 
 type Props = {
@@ -16,6 +18,16 @@ export function SettingsScreen({
   autoplayAudio,
   onAutoplayAudioChange,
 }: Props) {
+  const [debug, setDebug] = useState<SyncDebug | null>(null);
+
+  const loadDebug = () => {
+    getSyncDebug()
+      .then(setDebug)
+      .catch(() => setDebug(null));
+  };
+
+  useEffect(loadDebug, []);
+
   return (
     <ScrollView
       style={styles.screen}
@@ -51,6 +63,37 @@ export function SettingsScreen({
         </Text>
       </View>
 
+      <Text style={styles.sectionLabel}>SYNC DIAGNOSTICS</Text>
+      <View style={styles.card}>
+        <Pressable onPress={loadDebug} style={styles.refreshRow}>
+          <Text style={styles.rowTitle}>Collection sync state</Text>
+          <Text style={styles.refreshText}>Refresh</Text>
+        </Pressable>
+        {debug ? (
+          <View style={styles.debugBox}>
+            <DebugRow label="col.mod (last change)" value={debug.col.mod} />
+            <DebugRow label="col.scm (schema)" value={debug.col.scm} />
+            <DebugRow label="col.ls (last sync)" value={debug.col.ls} />
+            <DebugRow label="col.usn" value={debug.col.usn} />
+            <View style={styles.debugSep} />
+            <DebugRow label="pending cards (usn=-1)" value={debug.pendingCards} />
+            <DebugRow label="pending notes (usn=-1)" value={debug.pendingNotes} />
+            <DebugRow label="pending revlogs (usn=-1)" value={debug.pendingRevlogs} />
+            <DebugRow label="pending graves" value={debug.pendingGraves} />
+            <View style={styles.debugSep} />
+            <DebugRow label="total cards" value={debug.totalCards} />
+            <DebugRow label="total revlogs" value={debug.totalRevlogs} />
+          </View>
+        ) : (
+          <Text style={styles.rowDescription}>Tap refresh to load.</Text>
+        )}
+        <Text style={styles.debugHelp}>
+          If pending cards/revlogs stay &gt;0 after a sync, local reviews are
+          not being uploaded. If col.ls does not advance after a sync, the
+          server did not acknowledge the upload.
+        </Text>
+      </View>
+
       <Text style={styles.sectionLabel}>ABOUT</Text>
       <View style={styles.card}>
         <Text style={styles.rowTitle}>Kelma Mobile 0.1.0</Text>
@@ -58,6 +101,15 @@ export function SettingsScreen({
         <Text style={styles.license}>AGPL-3.0-or-later</Text>
       </View>
     </ScrollView>
+  );
+}
+
+function DebugRow({ label, value }: { label: string; value: number }) {
+  return (
+    <View style={styles.debugRow}>
+      <Text style={styles.debugLabel}>{label}</Text>
+      <Text style={styles.debugValue}>{value.toLocaleString()}</Text>
+    </View>
   );
 }
 
@@ -103,4 +155,30 @@ const styles = StyleSheet.create({
     marginTop: 5,
   },
   license: { color: palette.goldSoft, fontSize: 13, marginTop: 12 },
+  refreshRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  refreshText: { color: palette.goldSoft, fontSize: 13, fontWeight: '700' },
+  debugBox: { marginTop: 4 },
+  debugRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
+  debugLabel: { color: palette.textSecondary, fontSize: 13 },
+  debugValue: { color: palette.textPrimary, fontSize: 13, fontWeight: '700' },
+  debugSep: {
+    height: 1,
+    backgroundColor: palette.surfaceBorder,
+    marginVertical: 6,
+  },
+  debugHelp: {
+    color: palette.textMuted,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 12,
+  },
 });

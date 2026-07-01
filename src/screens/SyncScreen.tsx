@@ -27,6 +27,9 @@ import { palette } from './theme';
 
 type Props = {
   onSynced: () => void;
+  /** Called once after a successful sign-in, so credentials can be persisted
+   *  for the home Sync button. */
+  onSignedIn: (auth: SyncAuth) => void;
 };
 
 type StepState = 'pending' | 'running' | 'done' | 'error';
@@ -53,7 +56,7 @@ const INITIAL_STEPS: SyncStep[] = [
   },
 ];
 
-export function SyncScreen({ onSynced }: Props) {
+export function SyncScreen({ onSynced, onSignedIn }: Props) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [auth, setAuth] = useState<SyncAuth | null>(null);
@@ -128,6 +131,7 @@ export function SyncScreen({ onSynced }: Props) {
       ? Promise.resolve(auth)
       : syncLogin(username.trim(), password, DEFAULT_SYNC_ENDPOINT).then(nextAuth => {
           setAuth(nextAuth);
+          onSignedIn(nextAuth);
           updateStep('login', 'done', 'Signed in');
           return nextAuth;
         });
