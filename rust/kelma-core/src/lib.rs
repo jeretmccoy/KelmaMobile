@@ -362,6 +362,8 @@ fn dispatch_session(session: &KelmaSession, op: &str, input: &[u8]) -> Result<St
         "syncMediaPoll" => session.sync_media_poll()?,
         "syncStatus" => session.sync_status()?,
         "fullSync" => session.full_sync(&request)?,
+        "fullSyncStart" => session.full_sync_start(&request)?,
+        "fullSyncPoll" => session.full_sync_poll()?,
         other => return Err(format!("unknown session operation '{other}'")),
     };
 

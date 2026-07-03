@@ -676,3 +676,52 @@ export async function fullSync(
 ): Promise<void> {
   await runOp('fullSync', { ...auth, upload });
 }
+
+/** Live progress of a background full collection sync (byte counts). */
+export type FullSyncProgress = {
+  done: boolean;
+  ok?: boolean;
+  error?: string;
+  transferredBytes: number;
+  totalBytes: number;
+};
+
+async function fullSyncStart(auth: SyncAuth, upload: boolean): Promise<void> {
+  await runOp('fullSyncStart', {...auth, upload});
+}
+
+async function fullSyncPoll(): Promise<FullSyncProgress> {
+  return runOp<FullSyncProgress>('fullSyncPoll');
+}
+
+/**
+ * Full collection sync (`upload=false` downloads and replaces local) with live
+ * byte progress. Runs on a background thread in the core and polls, so the
+ * "replacing local collection" phase shows transferred/total bytes instead of
+ * freezing. Falls back to the blocking `fullSync` on un-rebuilt cores.
+ */
+export async function fullSyncMonitored(
+  auth: SyncAuth,
+  upload: boolean,
+  onProgress: (p: FullSyncProgress) => void,
+  intervalMs = 500,
+): Promise<void> {
+  try {
+    await fullSyncStart(auth, upload);
+  } catch {
+    await fullSync(auth, upload);
+    return;
+  }
+  const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+  for (;;) {
+    await sleep(intervalMs);
+    const p = await fullSyncPoll();
+    onProgress(p);
+    if (p.done) {
+      if (p.ok === false) {
+        throw new Error(p.error ?? 'Full sync failed.');
+      }
+      return;
+    }
+  }
+}

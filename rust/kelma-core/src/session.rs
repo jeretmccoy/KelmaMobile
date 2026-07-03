@@ -41,6 +41,12 @@ pub struct KelmaSession {
     /// Set by the media-sync worker thread when it finishes: `Ok(totals)` or
     /// `Err(message)`. `None` inside means still running.
     media_done: Mutex<Option<Arc<Mutex<Option<Result<Value, String>>>>>>,
+    /// Live progress cell of an in-flight background full collection sync
+    /// (`full_sync_start`) — carries `FullSyncProgress` byte counts.
+    full_progress: Mutex<Option<Arc<Mutex<ProgressState>>>>,
+    /// Result of the full-sync worker thread (the collection is consumed during
+    /// a full sync, so `full_sync_poll` reopens it once this is set).
+    full_done: Mutex<Option<Arc<Mutex<Option<Result<Value, String>>>>>>,
 }
 
 struct SessionState {
@@ -108,6 +114,8 @@ impl KelmaSession {
             }),
             media_progress: Mutex::new(None),
             media_done: Mutex::new(None),
+            full_progress: Mutex::new(None),
+            full_done: Mutex::new(None),
         }))
     }
 
@@ -1240,6 +1248,137 @@ impl KelmaSession {
             "checked": checked, "downloadedFiles": dl_files,
             "downloadedDeletions": dl_del, "uploadedFiles": up_files,
             "uploadedDeletions": up_del,
+        }))
+    }
+
+    /// Start a full collection sync (`upload=false` → download, replacing local)
+    /// on a background thread and return immediately. `full_sync_poll` reports
+    /// byte progress and, once finished, reopens the collection.
+    pub fn full_sync_start(&self, request: &Value) -> Result<Value, String> {
+        let auth = sync_auth_from(request)?;
+        let upload = request
+            .get("upload")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "missing 'upload' boolean".to_string())?;
+
+        if self
+            .full_progress
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?
+            .is_some()
+        {
+            return Err("a full sync is already running".to_string());
+        }
+
+        // Take the collection out (full sync consumes it) and grab its progress
+        // cell before moving it to the worker.
+        let (col, progress_cell) = {
+            let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+            let col = guard
+                .col
+                .take()
+                .ok_or_else(|| "collection is not open".to_string())?;
+            let progress_cell = col.shared_progress();
+            (col, progress_cell)
+        };
+
+        let done: Arc<Mutex<Option<Result<Value, String>>>> = Arc::new(Mutex::new(None));
+        *self
+            .full_progress
+            .lock()
+            .map_err(|_| "session poisoned".to_string())? = Some(progress_cell);
+        *self
+            .full_done
+            .lock()
+            .map_err(|_| "session poisoned".to_string())? = Some(done.clone());
+
+        thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if upload {
+                    block_on(col.full_upload(auth, web_client()))
+                } else {
+                    block_on(col.full_download(auth, web_client()))
+                }
+            }));
+            let result = match outcome {
+                Ok(Ok(())) => Ok(json!({ "completed": true, "upload": upload })),
+                Ok(Err(error)) => Err(format!("{error:?}")),
+                Err(_) => Err("full sync worker panicked".to_string()),
+            };
+            if let Ok(mut slot) = done.lock() {
+                *slot = Some(result);
+            }
+        });
+
+        Ok(json!({ "started": true }))
+    }
+
+    /// Poll an in-flight full sync. Returns `{done, transferredBytes,
+    /// totalBytes}`; once finished, reopens the (consumed) collection and adds
+    /// `{ok}` or `{ok:false, error}`.
+    pub fn full_sync_poll(&self) -> Result<Value, String> {
+        let (transferred, total) = {
+            let cell = self
+                .full_progress
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            match cell.as_ref().and_then(|arc| arc.lock().ok().and_then(|s| s.last_progress)) {
+                Some(Progress::FullSync(p)) => (p.transferred_bytes, p.total_bytes),
+                _ => (0, 0),
+            }
+        };
+
+        let finished = {
+            let slot = self
+                .full_done
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            match slot.as_ref() {
+                Some(done_arc) => done_arc
+                    .lock()
+                    .map_err(|_| "session poisoned".to_string())?
+                    .clone(),
+                None => return Err("no full sync is running".to_string()),
+            }
+        };
+
+        if let Some(result) = finished {
+            // The collection was consumed (and replaced on disk); reopen it so
+            // review can resume, whether the sync succeeded or failed.
+            {
+                let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+                if guard.col.is_none() {
+                    let reopened = build_collection(
+                        &guard.collection_path,
+                        &guard.media_folder_path,
+                        &guard.media_db_path,
+                    )?;
+                    guard.col = Some(reopened);
+                }
+            }
+            *self
+                .full_progress
+                .lock()
+                .map_err(|_| "session poisoned".to_string())? = None;
+            *self
+                .full_done
+                .lock()
+                .map_err(|_| "session poisoned".to_string())? = None;
+            return match result {
+                Ok(_) => Ok(json!({
+                    "done": true, "ok": true,
+                    "transferredBytes": transferred, "totalBytes": total,
+                })),
+                Err(error) => Ok(json!({
+                    "done": true, "ok": false, "error": error,
+                    "transferredBytes": transferred, "totalBytes": total,
+                })),
+            };
+        }
+
+        Ok(json!({
+            "done": false,
+            "transferredBytes": transferred, "totalBytes": total,
         }))
     }
 }

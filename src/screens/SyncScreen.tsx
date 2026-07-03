@@ -19,10 +19,11 @@ import {
 } from 'react-native';
 import { DEFAULT_SYNC_ENDPOINT, KELMA_SIGNUP_URL } from '../config';
 import {
-  fullSync,
+  fullSyncMonitored,
   syncCollection,
   syncLogin,
   syncMediaMonitored,
+  type FullSyncProgress,
   type SyncAuth,
 } from '../core/KelmaCore';
 import { headerStyles, palette, radius, shadow } from './theme';
@@ -109,12 +110,28 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
   const performSync = useCallback(
     async (credentials: SyncAuth, forceFullDownload: boolean) => {
       const t0 = Date.now();
+
+      // Live byte progress for a full collection transfer.
+      let lastFullLog = 0;
+      const onFull = (label: string) => (p: FullSyncProgress) => {
+        const detail =
+          p.totalBytes > 0
+            ? `${formatBytes(p.transferredBytes)} / ${formatBytes(p.totalBytes)}`
+            : formatBytes(p.transferredBytes);
+        updateStep('collection', 'running', `${label} ${detail}`);
+        setStatus(`${label} ${detail}`);
+        if (p.transferredBytes - lastFullLog >= 2 * 1024 * 1024) {
+          lastFullLog = p.transferredBytes;
+          pushLog(`Collection ${label} ${detail}`);
+        }
+      };
+
       // --- collection ---
       if (forceFullDownload) {
         updateStep('collection', 'running', 'Downloading full collection from server…');
         setStatus('Downloading the full collection…');
         pushLog('Replacing local collection with the server copy…');
-        await fullSync(credentials, false); // upload=false → full download
+        await fullSyncMonitored(credentials, false, onFull('Downloading collection…'));
         updateStep('collection', 'done', 'Full collection downloaded from server');
         pushLog('Full collection downloaded.', 'ok');
       } else {
@@ -125,18 +142,15 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
         pushLog(`Server says: ${outcome.required}.`);
         if (outcome.required === 'fullSyncRequired') {
           const download = outcome.downloadOk;
-          updateStep(
-            'collection',
-            'running',
-            download ? 'Downloading full collection…' : 'Uploading full collection…',
-          );
+          const label = download ? 'Downloading collection…' : 'Uploading collection…';
+          updateStep('collection', 'running', label);
           setStatus(download ? 'Downloading the full collection…' : 'Uploading the full collection…');
           pushLog(
             download
               ? 'Full sync required — downloading from server…'
               : 'Full sync required — uploading to server…',
           );
-          await fullSync(credentials, !download);
+          await fullSyncMonitored(credentials, !download, onFull(label));
           updateStep('collection', 'done', 'Full collection transfer complete');
           pushLog('Full collection transfer complete.', 'ok');
         } else {
