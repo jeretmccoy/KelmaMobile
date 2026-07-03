@@ -11,16 +11,18 @@ use anki::browser_table::Column;
 use anki::card::CardId;
 use anki::collection::{Collection, CollectionBuilder};
 use anki::decks::{DeckId, DeckKind};
-use anki::prelude::{AnkiError, OrNotFound};
+use anki::notetype::NotetypeId;
+use anki::prelude::{AnkiError, OrInvalid, OrNotFound};
 use anki::scheduler::answering::{CardAnswer, Rating};
 use anki::scheduler::states::SchedulingStates;
 use anki::search::{parse_search, JoinSearches, SearchBuilder, SearchNode, SortMode, StateKind};
-use anki::services::SearchService;
+use anki::services::{CardsService, NotesService, SearchService, TagsService};
 use anki::sync::login::{sync_login, SyncAuth};
 use anki::timestamp::{TimestampMillis, TimestampSecs};
 use anki::types::Usn;
 use anki_proto::decks::DeckTreeNode;
 use anki_proto::generic::StringList;
+use anki::import_export::package::ExportAnkiPackageOptions;
 use rusqlite::params;
 use serde_json::{json, Value};
 
@@ -60,11 +62,30 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 impl KelmaSession {
     /// Open or create a collection. `request` is `{collectionPath,
-    /// mediaFolderPath, mediaDbPath}`.
+    /// mediaFolderPath, mediaDbPath, timeZone?}`.
     pub fn open(request: &Value) -> Result<Box<KelmaSession>, String> {
         let collection_path = str_field(request, "collectionPath")?;
         let media_folder_path = str_field(request, "mediaFolderPath")?;
         let media_db_path = str_field(request, "mediaDbPath")?;
+
+        // rslib's day-rollover math (what counts as "today", and the seed for
+        // new/review queue shuffling) runs on `chrono::Local`, which reads
+        // `TZ`/the OS timezone database — not reliably correct inside an
+        // embedded mobile Rust runtime. Without this, the app can silently
+        // compute a different "today" than Anki Desktop/AnkiMobile for the
+        // same collection, producing a different due-card order. The
+        // platform layer resolves the device's real IANA timezone and passes
+        // it here; setting `TZ` before anything touches the scheduler makes
+        // `chrono::Local` agree with it.
+        if let Some(time_zone) = request.get("timeZone").and_then(Value::as_str) {
+            if !time_zone.is_empty() {
+                // SAFETY: called once, synchronously, before the collection
+                // (and any other thread that might read the environment) exists.
+                unsafe {
+                    std::env::set_var("TZ", time_zone);
+                }
+            }
+        }
 
         let col = build_collection(&collection_path, &media_folder_path, &media_db_path)?;
 
@@ -101,6 +122,48 @@ impl KelmaSession {
     pub fn media_dir(&self) -> Result<Value, String> {
         let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
         Ok(json!({ "dir": guard.media_folder_path }))
+    }
+
+    /// Write the reviewer's rendered card HTML to a scratch file next to (a
+    /// sibling of) the media folder, so the platform layer can load it via
+    /// `source.uri` instead of `source.html`. On iOS, `loadHTMLString:baseURL:`
+    /// (used for `source.html`) never grants the WKWebView's sandboxed
+    /// WebContent process read access to local `file://` subresources — only
+    /// `loadFileURL:allowingReadAccessToURL:` (the `source.uri` path) does,
+    /// which is why card images were never loading. `request` is `{html}`.
+    /// Returns `{uri, allowedRoot}` (both `file://` URLs); `allowedRoot` covers
+    /// both this scratch file and the media folder, since WebKit requires the
+    /// granted root to be an ancestor of the file actually being loaded.
+    pub fn write_card_html(&self, request: &Value) -> Result<Value, String> {
+        let html = str_field(request, "html")?;
+        let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let media_path = std::path::Path::new(&guard.media_folder_path);
+        let profile_dir = media_path
+            .parent()
+            .ok_or_else(|| "media folder has no parent directory".to_string())?;
+
+        // A fresh filename per render: WKWebView can otherwise keep serving a
+        // cached copy of a `file://` URL it already loaded even after the
+        // underlying file changes on disk.
+        let scratch_path = profile_dir.join(format!("kelma_card_{}.html", TimestampMillis::now().0));
+        std::fs::write(&scratch_path, html.as_bytes())
+            .map_err(|e| format!("writing scratch card html: {e}"))?;
+
+        // Best-effort cleanup of previous scratch renders.
+        if let Ok(entries) = std::fs::read_dir(profile_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("kelma_card_") && entry.path() != scratch_path {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        Ok(json!({
+            "uri": format!("file://{}", scratch_path.to_string_lossy()),
+            "allowedRoot": format!("file://{}/", profile_dir.to_string_lossy()),
+        }))
     }
 
     /// Set the deck that subsequent review pulls cards from. rslib's notion of
@@ -191,6 +254,40 @@ impl KelmaSession {
         })?;
 
         Ok(json!({ "answered": true }))
+    }
+
+    /// Whether there's a change to undo (an answered card, or a suspend/bury/
+    /// flag/delete from the card menu) and roughly what it was, so the
+    /// reviewer can show/hide its "Undo" control the way the desktop client's
+    /// Ctrl+Z tooltip does. `operation` is the `Debug` name of rslib's
+    /// internal `Op` (e.g. `"AnswerCard"`), not a localized string.
+    pub fn undo_status(&self) -> Result<Value, String> {
+        self.with_col(|col| {
+            let status = col.undo_status();
+            Ok(json!({
+                "canUndo": status.undo.is_some(),
+                "operation": status.undo.map(|op| format!("{op:?}")),
+            }))
+        })
+    }
+
+    /// Undo the last change, exactly like Ctrl+Z on the desktop client — this
+    /// reuses rslib's single global undo stack, so undoing after answering a
+    /// card re-queues it (the reviewer reloads `nextCard` afterwards to show
+    /// it again), while undoing after a suspend/bury/flag/delete reverts that
+    /// instead. Returns `{undone: false}` rather than an error when the stack
+    /// is empty, since callers may call this opportunistically.
+    pub fn undo(&self) -> Result<Value, String> {
+        self.with_col(|col| {
+            if col.can_undo().is_none() {
+                return Ok(json!({ "undone": false, "operation": Value::Null }));
+            }
+            let output = col.undo()?;
+            Ok(json!({
+                "undone": true,
+                "operation": format!("{:?}", output.output.undone_op),
+            }))
+        })
     }
 
     /// Collection statistics for the Stats screen: today's study message plus a
@@ -353,11 +450,376 @@ impl KelmaSession {
             // partial_render=false so the question/answer come back as a single
             // fully-rendered HTML string each, exactly like the reviewer gets.
             let rendered = col.render_existing_card(card_id, false, false)?;
+
+            // Surface the card's scheduling + flag state and the note's mark
+            // state so the card detail screen can show the right options
+            // (Suspend vs Unsuspend, Mark vs Unmark, current flag/deck).
+            let card = col.get_card(anki_proto::cards::CardId { cid: card_id.0 })?;
+            let note_id = card.note_id;
+            let note = col.get_note(anki_proto::notes::NoteId { nid: note_id })?;
+            let marked = note.tags.iter().any(|t| t == "marked");
+
             Ok(json!({
                 "cardId": card_id.0,
                 "question": rendered.question().into_owned(),
                 "answer": rendered.answer().into_owned(),
                 "css": rendered.css,
+                "noteId": note_id,
+                "deckId": card.deck_id,
+                "queue": card.queue,
+                "flags": card.flags,
+                "marked": marked,
+            }))
+        })
+    }
+
+    // --- Card actions (browser-style: suspend / bury / flag / deck / delete /
+    //     mark) ---------------------------------------------------------------
+    // All driven by rslib's own transactional ops so undo, USN stamping, and
+    // sync bookkeeping are identical to the desktop/AnkiDroid browser.
+
+    /// Suspend a single card. `request` is `{cardId}`.
+    pub fn suspend_card(&self, request: &Value) -> Result<Value, String> {
+        let card_id = CardId(i64_field(request, "cardId")?);
+        self.with_col(|col| {
+            let out = col.bury_or_suspend_cards(
+                &[card_id],
+                anki_proto::scheduler::bury_or_suspend_cards_request::Mode::Suspend,
+            )?;
+            Ok(json!({ "count": out.output }))
+        })
+    }
+
+    /// Unsuspend (or unbury) a single card. `request` is `{cardId}`.
+    pub fn unsuspend_card(&self, request: &Value) -> Result<Value, String> {
+        let card_id = CardId(i64_field(request, "cardId")?);
+        self.with_col(|col| {
+            col.unbury_or_unsuspend_cards(&[card_id])?;
+            Ok(json!({ "restored": true }))
+        })
+    }
+
+    /// User-bury a single card (hide it from reviews until manually unburied or
+    /// the next day rollover). `request` is `{cardId}`.
+    pub fn bury_card(&self, request: &Value) -> Result<Value, String> {
+        let card_id = CardId(i64_field(request, "cardId")?);
+        self.with_col(|col| {
+            let out = col.bury_or_suspend_cards(
+                &[card_id],
+                anki_proto::scheduler::bury_or_suspend_cards_request::Mode::BuryUser,
+            )?;
+            Ok(json!({ "count": out.output }))
+        })
+    }
+
+    /// Set the flag (0-7) on a single card. `request` is `{cardId, flag}`.
+    pub fn set_card_flag(&self, request: &Value) -> Result<Value, String> {
+        let card_id = CardId(i64_field(request, "cardId")?);
+        let flag = u64_field(request, "flag")? as u32;
+        self.with_col(|col| {
+            col.set_card_flag(&[card_id], flag)?;
+            Ok(json!({ "flag": flag }))
+        })
+    }
+
+    /// Move a single card to another deck. `request` is `{cardId, deckId}`.
+    pub fn set_card_deck(&self, request: &Value) -> Result<Value, String> {
+        let card_id = CardId(i64_field(request, "cardId")?);
+        let deck_id = DeckId(i64_field(request, "deckId")?);
+        self.with_col(|col| {
+            col.set_deck(&[card_id], deck_id)?;
+            Ok(json!({ "deckId": deck_id.0 }))
+        })
+    }
+
+    /// Delete a card (and its note if no other cards reference it). `request`
+    /// is `{cardId}`.
+    pub fn delete_card(&self, request: &Value) -> Result<Value, String> {
+        let card_id = i64_field(request, "cardId")?;
+        self.with_col(|col| {
+            let out = col.remove_cards(anki_proto::cards::RemoveCardsRequest {
+                card_ids: vec![card_id],
+            })?;
+            Ok(json!({ "count": out.count }))
+        })
+    }
+
+    /// Toggle the "marked" tag on the card's note. `request` is `{cardId}`.
+    /// Returns `{marked: bool}` for the new state.
+    pub fn toggle_card_mark(&self, request: &Value) -> Result<Value, String> {
+        let card_id = i64_field(request, "cardId")?;
+        self.with_col(|col| {
+            let card = col.get_card(anki_proto::cards::CardId { cid: card_id })?;
+            let note_id = card.note_id;
+            let note = col.get_note(anki_proto::notes::NoteId { nid: note_id })?;
+            let marked = note.tags.iter().any(|t| t == "marked");
+            if marked {
+                let _ = col.remove_note_tags(anki_proto::tags::NoteIdsAndTagsRequest {
+                    note_ids: vec![note_id],
+                    tags: "marked".to_owned(),
+                })?;
+            } else {
+                let _ = col.add_note_tags(anki_proto::tags::NoteIdsAndTagsRequest {
+                    note_ids: vec![note_id],
+                    tags: "marked".to_owned(),
+                })?;
+            }
+            Ok(json!({ "marked": !marked }))
+        })
+    }
+
+    // --- Note editing --------------------------------------------------------
+
+    /// Fetch a card's note for editing: the note id, notetype id/name, the
+    /// field names (from the notetype) paired with the note's current field
+    /// values, and the tags. `request` is `{cardId}`.
+    pub fn get_note_edit(&self, request: &Value) -> Result<Value, String> {
+        let card_id = i64_field(request, "cardId")?;
+        self.with_col(|col| {
+            let card = col.get_card(anki_proto::cards::CardId { cid: card_id })?;
+            let note_id = card.note_id;
+            let note = col.get_note(anki_proto::notes::NoteId { nid: note_id })?;
+            let nt = col
+                .get_notetype(NotetypeId(note.notetype_id))?
+                .or_invalid("note type")?;
+            let field_names: Vec<String> = nt.fields.iter().map(|f| f.name.clone()).collect();
+            let values: Vec<String> = note.fields.clone();
+            // Pad/truncate to the notetype's field count so the editor always
+            // has one value per field even if the note is stale.
+            let fields = field_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    json!({
+                        "name": name,
+                        "value": values.get(i).cloned().unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "noteId": note_id,
+                "notetypeId": nt.id.0,
+                "notetypeName": nt.name,
+                "fields": fields,
+                "tags": note.tags,
+            }))
+        })
+    }
+
+    /// Save an edited note. `request` is `{noteId, notetypeId, fields: [str],
+    /// tags: [str]}`. Builds a proto `Note` and calls rslib's `update_notes`,
+    /// which re-renders templates, regenerates cards, normalizes text, and
+    /// stamps USN/mod exactly like the desktop editor.
+    pub fn update_note(&self, request: &Value) -> Result<Value, String> {
+        let note_id = i64_field(request, "noteId")?;
+        let notetype_id = i64_field(request, "notetypeId")?;
+        let fields = request
+            .get("fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing 'fields' array".to_string())?
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        let tags = request
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.with_col(|col| {
+            let _ = col.update_notes(anki_proto::notes::UpdateNotesRequest {
+                notes: vec![anki_proto::notes::Note {
+                    id: note_id,
+                    guid: String::new(),
+                    notetype_id,
+                    mtime_secs: 0,
+                    usn: 0,
+                    tags,
+                    fields,
+                }],
+                skip_undo_entry: false,
+            })?;
+            Ok(json!({ "saved": true }))
+        })
+    }
+
+    // --- Add / notetypes ------------------------------------------------------
+
+    /// List every notetype in the collection, with field names (in order) and a
+    /// use count, so the Add screen can offer a notetype picker and lay out one
+    /// field editor per notetype field — exactly like AnkiDroid's Add screen.
+    pub fn notetypes(&self) -> Result<Value, String> {
+        self.with_col(|col| {
+            let nts = col.get_all_notetypes()?;
+            let list: Vec<Value> = nts
+                .iter()
+                .map(|nt| {
+                    json!({
+                        "id": nt.id.0,
+                        "name": nt.name,
+                        "fields": nt.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+                        "useCount": 0,
+                    })
+                })
+                .collect();
+            Ok(json!({ "notetypes": list }))
+        })
+    }
+
+    /// Create a new note (and its generated cards) in the given deck, the
+    /// rslib equivalent of AnkiDroid's Add. Builds a blank note from the
+    /// notetype, fills the fields in order, sets the tags, and calls
+    /// `Collection::add_note`, which re-renders templates, generates cards,
+    /// normalizes text, and stamps USN/mod exactly like the desktop editor.
+    /// `request` is `{notetypeId, deckId, fields: [str], tags: [str]}`. Returns
+    /// `{noteId}`.
+    pub fn add_note(&self, request: &Value) -> Result<Value, String> {
+        let notetype_id = NotetypeId(i64_field(request, "notetypeId")?);
+        let deck_id = DeckId(i64_field(request, "deckId")?);
+        let fields = request
+            .get("fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing 'fields' array".to_string())?
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        let tags = request
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.with_col(|col| {
+            let nt = col
+                .get_notetype(notetype_id)?
+                .or_invalid("note type")?;
+            let mut note = nt.new_note();
+            for (idx, value) in fields.iter().enumerate() {
+                // `set_field` errors on out-of-range indices; pad defensively
+                // so a mismatched field count can't abort the whole add.
+                if idx < note.fields().len() {
+                    note.set_field(idx, value.clone())?;
+                }
+            }
+            note.tags = tags;
+            let out = col.add_note(&mut note, deck_id)?;
+            Ok(json!({ "noteId": note.id.0, "cards": out.output }))
+        })
+    }
+
+    /// Check a note's fields before adding — the same check Anki's Add screen
+    /// runs via `Collection::note_fields_check`. Returns `{state}` where state
+    /// is: 0=normal, 1=empty first field, 2=duplicate first field, 3=missing
+    /// cloze, 4=notetype not cloze, 5=field not cloze. The UI uses this to
+    /// warn the user before creating a duplicate note (the cause of the 1-card
+    /// sync divergence when the same content exists on the server with a
+    /// different GUID). `request` is `{notetypeId, fields: [str]}`.
+    pub fn check_note_fields(&self, request: &Value) -> Result<Value, String> {
+        let notetype_id = NotetypeId(i64_field(request, "notetypeId")?);
+        let fields = request
+            .get("fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing 'fields' array".to_string())?
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        self.with_col(|col| {
+            let nt = col
+                .get_notetype(notetype_id)?
+                .or_invalid("note type")?;
+            let mut note = nt.new_note();
+            for (idx, value) in fields.iter().enumerate() {
+                if idx < note.fields().len() {
+                    note.set_field(idx, value.clone())?;
+                }
+            }
+            let state = col.note_fields_check(&note)?;
+            Ok(json!({ "state": state as i32 }))
+        })
+    }
+
+    // --- Export --------------------------------------------------------------
+
+    /// Export a deck (and its subdecks) to an `.apkg` package, like AnkiDroid's
+    /// Export. Writes the file into the OS temp dir and returns its absolute
+    /// path plus the note count, so the platform layer can hand it to a share
+    /// sheet. `request` is `{deckId, deckName, withScheduling, withMedia,
+    /// withDeckConfigs}`.
+    pub fn export_deck(&self, request: &Value) -> Result<Value, String> {
+        let deck_id = DeckId(i64_field(request, "deckId")?);
+        let deck_name = request
+            .get("deckName")
+            .and_then(Value::as_str)
+            .unwrap_or("export");
+        let with_scheduling = request
+            .get("withScheduling")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let with_media = request
+            .get("withMedia")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let with_deck_configs = request
+            .get("withDeckConfigs")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        self.with_col(|col| {
+            let options = ExportAnkiPackageOptions {
+                with_scheduling,
+                with_deck_configs,
+                with_media,
+                legacy: false,
+            };
+            let search = SearchNode::from_deck_id(deck_id, true);
+            let path = export_path_for(deck_name);
+            let notes = col.export_apkg(&path, options, search, None)?;
+            Ok(json!({ "path": path, "notes": notes }))
+        })
+    }
+
+    /// Import an `.apkg` package into the collection, like AnkiDroid's Import.
+    /// `request` is `{packagePath, mergeNotetypes?, withScheduling?,
+    /// withDeckConfigs?}`. rslib's `import_apkg` handles the full zip extract,
+    /// note/notetype merge, deck creation, media restore, and USN stamping
+    /// exactly like the desktop importer. Returns a one-line summary of what
+    /// landed: added / updated / duplicates / conflicts / foundNotes.
+    pub fn import_apkg(&self, request: &Value) -> Result<Value, String> {
+        let package_path = str_field(request, "packagePath")?;
+        let merge_notetypes = request
+            .get("mergeNotetypes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let with_scheduling = request
+            .get("withScheduling")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let with_deck_configs = request
+            .get("withDeckConfigs")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        self.with_col(|col| {
+            let options = anki_proto::import_export::ImportAnkiPackageOptions {
+                merge_notetypes,
+                with_scheduling,
+                with_deck_configs,
+                ..Default::default()
+            };
+            let out = col.import_apkg(&package_path, options)?;
+            let log = out.output;
+            Ok(json!({
+                "added": log.new.len(),
+                "updated": log.updated.len(),
+                "duplicates": log.duplicate.len(),
+                "conflicts": log.conflicting.len(),
+                "foundNotes": log.found_notes,
             }))
         })
     }
@@ -635,6 +1097,21 @@ impl KelmaSession {
     }
 }
 
+/// Build a unique, filesystem-safe `.apkg` path in the OS temp dir for an
+/// export. Slugs the deck name (falling back to "export") and stamps the
+/// current time so repeated exports of the same deck don't collide.
+fn export_path_for(deck_name: &str) -> String {
+    let slug: String = deck_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    let slug = if slug.is_empty() { "export".to_owned() } else { slug };
+    let stamp = TimestampMillis::now().0;
+    let mut path = std::env::temp_dir();
+    path.push(format!("{slug}-{stamp}.apkg"));
+    path.to_string_lossy().into_owned()
+}
+
 fn media_folder_totals(path: &str) -> Result<(u64, u64), String> {
     let entries = std::fs::read_dir(path).map_err(|e| format!("reading media folder: {e}"))?;
     let mut files = 0;
@@ -670,7 +1147,11 @@ fn sync_auth_from(request: &Value) -> Result<SyncAuth, String> {
     Ok(SyncAuth {
         hkey,
         endpoint: Some(endpoint),
-        io_timeout_secs: None,
+        // Generous per-request timeout so a large full-download or a big media
+        // batch over a slow connection isn't killed mid-transfer. rslib applies
+        // this to its sync HTTP requests; None would fall back to a shorter
+        // default that a first-time full sync can exceed.
+        io_timeout_secs: Some(600),
     })
 }
 
