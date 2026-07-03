@@ -20,6 +20,7 @@ import {
 import { DEFAULT_SYNC_ENDPOINT, KELMA_SIGNUP_URL } from '../config';
 import {
   fullSyncMonitored,
+  resetMedia,
   syncCollection,
   syncLogin,
   syncMediaMonitored,
@@ -114,6 +115,13 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
       // Live byte progress for a full collection transfer.
       let lastFullLog = 0;
       const onFull = (label: string) => (p: FullSyncProgress) => {
+        if (p.retrying) {
+          updateStep('collection', 'running', `Connection dropped — retrying (try ${p.retrying + 1})…`);
+          setStatus(`Collection connection dropped — retrying (attempt ${p.retrying + 1})…`);
+          pushLog(`Connection dropped — retrying collection (attempt ${p.retrying + 1})…`, 'error');
+          lastFullLog = 0;
+          return;
+        }
         const detail =
           p.totalBytes > 0
             ? `${formatBytes(p.transferredBytes)} / ${formatBytes(p.totalBytes)}`
@@ -134,6 +142,18 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
         await fullSyncMonitored(credentials, false, onFull('Downloading collection…'));
         updateStep('collection', 'done', 'Full collection downloaded from server');
         pushLog('Full collection downloaded.', 'ok');
+        // A true reset: clear local media so the media phase DOWNLOADS the
+        // server's copy instead of pushing this device's files back up.
+        try {
+          pushLog('Clearing local media to download the server copy…');
+          await resetMedia();
+          pushLog('Local media cleared.', 'ok');
+        } catch {
+          pushLog(
+            'Could not clear local media — rebuild the app so reset downloads instead of uploads.',
+            'error',
+          );
+        }
       } else {
         updateStep('collection', 'running', 'Checking collection changes…');
         setStatus('Syncing collection…');
@@ -169,15 +189,21 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
       pushLog('Syncing media (images & audio)…');
       let lastLoggedFiles = 0;
       const media = await syncMediaMonitored(credentials, p => {
-        const detail = `↓ ${p.downloadedFiles.toLocaleString()} downloaded · ${p.checked.toLocaleString()} checked${
-          p.uploadedFiles ? ` · ↑ ${p.uploadedFiles.toLocaleString()}` : ''
-        }`;
+        if (p.retrying) {
+          updateStep('media', 'running', `Connection dropped — resuming (try ${p.retrying + 1})…`);
+          setStatus(`Media connection dropped — resuming (attempt ${p.retrying + 1})…`);
+          pushLog(`Connection dropped — resuming media sync (attempt ${p.retrying + 1})…`, 'error');
+          lastLoggedFiles = 0;
+          return;
+        }
+        const moved = Math.max(p.downloadedFiles, p.uploadedFiles);
+        const detail = `↓ ${p.downloadedFiles.toLocaleString()} · ↑ ${p.uploadedFiles.toLocaleString()} · ${p.checked.toLocaleString()} checked`;
         updateStep('media', 'running', detail);
-        setStatus(`Syncing media… ${p.downloadedFiles.toLocaleString()} files`);
+        setStatus(`Syncing media… ${moved.toLocaleString()} files transferred`);
         // Log a milestone every 200 files so the log stays useful, not spammy.
-        if (p.downloadedFiles - lastLoggedFiles >= 200) {
-          lastLoggedFiles = p.downloadedFiles;
-          pushLog(`Media: ${p.downloadedFiles.toLocaleString()} files downloaded…`);
+        if (moved - lastLoggedFiles >= 200) {
+          lastLoggedFiles = moved;
+          pushLog(`Media: ↓${p.downloadedFiles.toLocaleString()} ↑${p.uploadedFiles.toLocaleString()} transferred…`);
         }
       });
       const mediaDetail = `${media.files.toLocaleString()} files · ${formatBytes(media.bytes)}`;

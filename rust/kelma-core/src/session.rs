@@ -1381,6 +1381,42 @@ impl KelmaSession {
             "transferredBytes": transferred, "totalBytes": total,
         }))
     }
+
+    /// Wipe this device's local media: delete every file in the media folder and
+    /// the media DB (so media-sync state resets to empty), then reopen. After
+    /// this, a media sync has nothing local to push and downloads the server's
+    /// media instead — the media half of a "reset & download from server".
+    pub fn reset_media(&self) -> Result<Value, String> {
+        let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+
+        // Close the collection first so no handle keeps media.db open.
+        guard.col.take();
+
+        let media_dir = std::path::Path::new(&guard.media_folder_path).to_path_buf();
+        if media_dir.exists() {
+            for entry in std::fs::read_dir(&media_dir).map_err(|e| format!("read media dir: {e}"))? {
+                let entry = entry.map_err(|e| format!("read media entry: {e}"))?;
+                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        } else {
+            std::fs::create_dir_all(&media_dir).map_err(|e| format!("create media dir: {e}"))?;
+        }
+
+        // Drop the media DB (+ WAL/SHM) so sync state starts clean.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", guard.media_db_path, suffix));
+        }
+
+        let reopened = build_collection(
+            &guard.collection_path,
+            &guard.media_folder_path,
+            &guard.media_db_path,
+        )?;
+        guard.col = Some(reopened);
+        Ok(json!({ "reset": true }))
+    }
 }
 
 /// Build a unique, filesystem-safe `.apkg` path in the OS temp dir for an

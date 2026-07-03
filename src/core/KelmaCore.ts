@@ -628,7 +628,17 @@ export type MediaProgress = {
   downloadedDeletions: number;
   uploadedFiles: number;
   uploadedDeletions: number;
+  /** Set on the progress callback when a dropped connection is being retried. */
+  retrying?: number;
 };
+
+/** A dropped/interrupted connection worth auto-resuming (media sync commits
+ * progress per batch, so restarting picks up where it left off). */
+function isTransientSyncError(message: string): boolean {
+  return /network|sending request|timed? ?out|timeout|connection|reset|closed|broken pipe|eof|502|503|504|522|524/i.test(
+    message,
+  );
+}
 
 async function syncMediaStart(auth: SyncAuth): Promise<void> {
   await runOp('syncMediaStart', auth);
@@ -650,24 +660,51 @@ export async function syncMediaMonitored(
   onProgress: (p: MediaProgress) => void,
   intervalMs = 700,
 ): Promise<MediaSyncResult> {
-  try {
-    await syncMediaStart(auth);
-  } catch {
-    // Older core without background media sync — use the blocking path.
-    return syncMedia(auth);
-  }
   const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-  for (;;) {
-    await sleep(intervalMs);
-    const p = await syncMediaPoll();
-    onProgress(p);
-    if (p.done) {
-      if (p.ok === false) {
-        throw new Error(p.error ?? 'Media sync failed.');
+  // A big media library transferred over a metered/CDN connection can drop
+  // mid-transfer. Media sync commits progress per batch, so we auto-restart on
+  // a transient error and resume from where the server already has files.
+  const maxAttempts = 30;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      try {
+        await syncMediaStart(auth);
+      } catch {
+        // Older core without background media sync — use the blocking path.
+        return syncMedia(auth);
       }
-      return { files: p.files ?? 0, bytes: p.bytes ?? 0 };
+      for (;;) {
+        await sleep(intervalMs);
+        const p = await syncMediaPoll();
+        onProgress(p);
+        if (p.done) {
+          if (p.ok === false) {
+            throw new Error(p.error ?? 'Media sync failed.');
+          }
+          return { files: p.files ?? 0, bytes: p.bytes ?? 0 };
+        }
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt < maxAttempts && isTransientSyncError(lastError.message)) {
+        onProgress({
+          done: false,
+          checked: 0,
+          downloadedFiles: 0,
+          downloadedDeletions: 0,
+          uploadedFiles: 0,
+          uploadedDeletions: 0,
+          retrying: attempt,
+        });
+        await sleep(2000);
+        continue;
+      }
+      throw lastError;
     }
   }
+  throw lastError ?? new Error('Media sync failed.');
 }
 
 export async function fullSync(
@@ -677,6 +714,15 @@ export async function fullSync(
   await runOp('fullSync', { ...auth, upload });
 }
 
+/**
+ * Wipe this device's local media (files + media DB) so the next media sync has
+ * nothing to push and instead downloads the server's copy. Used by "reset &
+ * download from server" to make the media half download-only.
+ */
+export async function resetMedia(): Promise<void> {
+  await runOp('resetMedia');
+}
+
 /** Live progress of a background full collection sync (byte counts). */
 export type FullSyncProgress = {
   done: boolean;
@@ -684,6 +730,8 @@ export type FullSyncProgress = {
   error?: string;
   transferredBytes: number;
   totalBytes: number;
+  /** Set on the progress callback when a dropped connection is being retried. */
+  retrying?: number;
 };
 
 async function fullSyncStart(auth: SyncAuth, upload: boolean): Promise<void> {
@@ -706,22 +754,38 @@ export async function fullSyncMonitored(
   onProgress: (p: FullSyncProgress) => void,
   intervalMs = 500,
 ): Promise<void> {
-  try {
-    await fullSyncStart(auth, upload);
-  } catch {
-    await fullSync(auth, upload);
-    return;
-  }
   const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-  for (;;) {
-    await sleep(intervalMs);
-    const p = await fullSyncPoll();
-    onProgress(p);
-    if (p.done) {
-      if (p.ok === false) {
-        throw new Error(p.error ?? 'Full sync failed.');
+  const maxAttempts = 6;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      try {
+        await fullSyncStart(auth, upload);
+      } catch {
+        await fullSync(auth, upload);
+        return;
       }
-      return;
+      for (;;) {
+        await sleep(intervalMs);
+        const p = await fullSyncPoll();
+        onProgress(p);
+        if (p.done) {
+          if (p.ok === false) {
+            throw new Error(p.error ?? 'Full sync failed.');
+          }
+          return;
+        }
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt < maxAttempts && isTransientSyncError(lastError.message)) {
+        onProgress({ done: false, retrying: attempt, transferredBytes: 0, totalBytes: 0 });
+        await sleep(2000);
+        continue;
+      }
+      throw lastError;
     }
   }
+  throw lastError ?? new Error('Full sync failed.');
 }
