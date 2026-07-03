@@ -7,6 +7,7 @@ import { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -15,7 +16,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { DEFAULT_SYNC_ENDPOINT } from '../config';
+import { DEFAULT_SYNC_ENDPOINT, KELMA_SIGNUP_URL } from '../config';
 import {
   fullSync,
   syncCollection,
@@ -23,7 +24,7 @@ import {
   syncMedia,
   type SyncAuth,
 } from '../core/KelmaCore';
-import { palette } from './theme';
+import { headerStyles, palette, radius, shadow } from './theme';
 
 type Props = {
   onSynced: () => void;
@@ -57,12 +58,15 @@ const INITIAL_STEPS: SyncStep[] = [
 ];
 
 export function SyncScreen({ onSynced, onSignedIn }: Props) {
-  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [auth, setAuth] = useState<SyncAuth | null>(null);
   const [status, setStatus] = useState('Sign in to sync your collection and media.');
   const [busy, setBusy] = useState(false);
   const [steps, setSteps] = useState<SyncStep[]>(INITIAL_STEPS);
+
+  // Client-side gate for the submit button when not already signed in.
+  const credsIncomplete = !email.trim() || !password;
 
   const updateStep = useCallback(
     (key: SyncStep['key'], state: StepState, detail?: string) => {
@@ -129,7 +133,7 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
     }
     const credentials = auth
       ? Promise.resolve(auth)
-      : syncLogin(username.trim(), password, DEFAULT_SYNC_ENDPOINT).then(nextAuth => {
+      : syncLogin(email.trim(), password, DEFAULT_SYNC_ENDPOINT).then(nextAuth => {
           setAuth(nextAuth);
           onSignedIn(nextAuth);
           updateStep('login', 'done', 'Signed in');
@@ -171,8 +175,10 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
       <ScrollView
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled">
-        <Text style={styles.eyebrow}>KELMA</Text>
-        <Text style={styles.title}>Sync</Text>
+        <View style={[headerStyles.titleRow, styles.titleRow]}>
+          <View style={headerStyles.accentTall} />
+          <Text style={styles.title}>Sync</Text>
+        </View>
         <Text style={styles.intro}>
           Sync cards, scheduling data, images, and audio through Anki’s Rust
           sync protocol.
@@ -186,13 +192,14 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
             <>
               <TextInput
                 style={styles.input}
-                placeholder="Username or email"
+                placeholder="Email"
                 placeholderTextColor={palette.textMuted}
                 autoCapitalize="none"
                 autoCorrect={false}
+                keyboardType="email-address"
                 textContentType="username"
-                value={username}
-                onChangeText={setUsername}
+                value={email}
+                onChangeText={setEmail}
               />
               <TextInput
                 style={styles.input}
@@ -203,6 +210,14 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
                 value={password}
                 onChangeText={setPassword}
               />
+              <Pressable
+                accessibilityRole="link"
+                onPress={() => Linking.openURL(KELMA_SIGNUP_URL)}
+                hitSlop={8}>
+                <Text style={styles.signupLink}>
+                  No account? Create one on Kelma Immersion ›
+                </Text>
+              </Pressable>
             </>
           )}
 
@@ -216,6 +231,8 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
                 <View style={styles.progressIcon}>
                   {step.state === 'running' ? (
                     <ActivityIndicator size="small" color={palette.gold} />
+                  ) : step.state === 'pending' ? (
+                    <View style={styles.progressPending} />
                   ) : (
                     <Text
                       style={[
@@ -223,11 +240,7 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
                         step.state === 'done' && styles.progressDone,
                         step.state === 'error' && styles.progressError,
                       ]}>
-                      {step.state === 'done'
-                        ? '✓'
-                        : step.state === 'error'
-                          ? '!'
-                          : '•'}
+                      {step.state === 'done' ? '✓' : '!'}
                     </Text>
                   )}
                 </View>
@@ -242,12 +255,11 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Sync collection and media"
-            disabled={busy || (!auth && (!username.trim() || !password))}
+            disabled={busy || (!auth && credsIncomplete)}
             onPress={sync}
             style={({ pressed }) => [
               styles.syncButton,
-              (busy || (!auth && (!username.trim() || !password))) &&
-                styles.disabled,
+              (busy || (!auth && credsIncomplete)) && styles.disabled,
               pressed && styles.pressed,
             ]}>
             {busy ? (
@@ -281,18 +293,12 @@ function formatBytes(bytes: number): string {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: palette.background },
   content: { paddingHorizontal: 24, paddingTop: 36, paddingBottom: 40 },
-  eyebrow: {
-    color: palette.gold,
-    fontSize: 13,
-    fontWeight: '800',
-    letterSpacing: 3.2,
-    marginBottom: 10,
-  },
+  titleRow: {},
   title: {
     color: palette.textPrimary,
-    fontSize: 34,
-    fontWeight: '700',
-    letterSpacing: -1,
+    fontSize: 38,
+    fontWeight: '800',
+    letterSpacing: -1.2,
   },
   intro: {
     color: palette.textSecondary,
@@ -305,8 +311,9 @@ const styles = StyleSheet.create({
     backgroundColor: palette.surface,
     borderColor: palette.surfaceBorder,
     borderWidth: 1,
-    borderRadius: 18,
+    borderRadius: radius.lg,
     padding: 20,
+    ...shadow.card,
   },
   sectionTitle: { color: palette.textPrimary, fontSize: 18, fontWeight: '700' },
   endpoint: {
@@ -314,6 +321,13 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 4,
     marginBottom: 18,
+  },
+  signupLink: {
+    color: palette.gold,
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 2,
+    marginBottom: 6,
   },
   input: {
     backgroundColor: palette.background,
@@ -344,6 +358,13 @@ const styles = StyleSheet.create({
     minHeight: 50,
   },
   progressIcon: { width: 32, alignItems: 'flex-start' },
+  progressPending: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: palette.surfaceBorder,
+  },
   progressMark: { color: palette.textMuted, fontSize: 20, fontWeight: '800' },
   progressDone: { color: palette.good },
   progressError: { color: palette.bad },
@@ -355,12 +376,13 @@ const styles = StyleSheet.create({
   },
   progressDetail: { color: palette.textMuted, fontSize: 12, marginTop: 2 },
   syncButton: {
-    minHeight: 50,
-    backgroundColor: palette.goldSoft,
-    borderRadius: 12,
+    minHeight: 52,
+    backgroundColor: palette.gold,
+    borderRadius: radius.md,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 4,
+    ...shadow.card,
   },
   disabled: { opacity: 0.45 },
   pressed: { opacity: 0.75 },

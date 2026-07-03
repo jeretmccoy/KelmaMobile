@@ -8,13 +8,20 @@
  * Anki-wire-compatible sync server. Anki clients append `/sync/*` and
  * `/msync/*` to this base URL, so it must be the gateway root.
  *
- * This must be reachable from the device running Kelma Mobile — on a physical
- * phone, `127.0.0.1` means the phone itself, so use the host machine's LAN IP
- * (and keep the phone on the same Wi-Fi network as the KelmaSync server).
- * Override per-user once a settings screen exists.
+ * Points at the public KelmaSync deployment, reachable from any network
+ * (served through Cloudflare → cloudflared tunnel → gateway on bev). Override
+ * per-user once a settings screen exists.
  */
-export const DEFAULT_SYNC_ENDPOINT = 'http://192.168.1.225:8080';
+export const DEFAULT_SYNC_ENDPOINT = 'https://sync.kelma.tech';
 
+
+/**
+ * Where users create a Kelma account. Account creation is owned by Kelma
+ * Immersion (the web app, currently ankiai.tech, moving to kelma.tech) — the
+ * app links out here for sign-up and only signs in with the resulting
+ * email + password. Kept as one constant for an easy swap at rebrand.
+ */
+export const KELMA_SIGNUP_URL = 'https://ankiai.tech';
 
 /**
  * The client version string reported to the sync server. Tracks the pinned
