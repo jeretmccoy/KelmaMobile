@@ -616,6 +616,60 @@ export async function syncMedia(auth: SyncAuth): Promise<MediaSyncResult> {
   return runOp<MediaSyncResult>('syncMedia', auth);
 }
 
+/** Live progress of a background media sync (see `syncMediaMonitored`). */
+export type MediaProgress = {
+  done: boolean;
+  ok?: boolean;
+  error?: string;
+  files?: number; // final total files on disk, once done
+  bytes?: number; // final total bytes on disk, once done
+  checked: number;
+  downloadedFiles: number;
+  downloadedDeletions: number;
+  uploadedFiles: number;
+  uploadedDeletions: number;
+};
+
+async function syncMediaStart(auth: SyncAuth): Promise<void> {
+  await runOp('syncMediaStart', auth);
+}
+
+async function syncMediaPoll(): Promise<MediaProgress> {
+  return runOp<MediaProgress>('syncMediaPoll');
+}
+
+/**
+ * Media sync with live progress. Runs the transfer on a background thread in the
+ * core and polls it, invoking `onProgress` with running counts — so a large
+ * (multi-GB) media download shows real activity instead of a frozen spinner.
+ * Falls back to the blocking `syncMedia` on cores that predate the start/poll
+ * ops (i.e. before the app is rebuilt).
+ */
+export async function syncMediaMonitored(
+  auth: SyncAuth,
+  onProgress: (p: MediaProgress) => void,
+  intervalMs = 700,
+): Promise<MediaSyncResult> {
+  try {
+    await syncMediaStart(auth);
+  } catch {
+    // Older core without background media sync — use the blocking path.
+    return syncMedia(auth);
+  }
+  const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+  for (;;) {
+    await sleep(intervalMs);
+    const p = await syncMediaPoll();
+    onProgress(p);
+    if (p.done) {
+      if (p.ok === false) {
+        throw new Error(p.error ?? 'Media sync failed.');
+      }
+      return { files: p.files ?? 0, bytes: p.bytes ?? 0 };
+    }
+  }
+}
+
 export async function fullSync(
   auth: SyncAuth,
   upload: boolean,

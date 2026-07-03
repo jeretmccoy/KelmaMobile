@@ -22,7 +22,7 @@ import {
   fullSync,
   syncCollection,
   syncLogin,
-  syncMedia,
+  syncMediaMonitored,
   type SyncAuth,
 } from '../core/KelmaCore';
 import { headerStyles, palette, radius, shadow } from './theme';
@@ -149,11 +149,23 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
         }
       }
 
-      // --- media ---
-      updateStep('media', 'running', 'Checking and transferring media…');
+      // --- media (live progress: runs on a background thread, polled here) ---
+      updateStep('media', 'running', 'Checking media…');
       setStatus('Syncing images and audio…');
       pushLog('Syncing media (images & audio)…');
-      const media = await syncMedia(credentials);
+      let lastLoggedFiles = 0;
+      const media = await syncMediaMonitored(credentials, p => {
+        const detail = `↓ ${p.downloadedFiles.toLocaleString()} downloaded · ${p.checked.toLocaleString()} checked${
+          p.uploadedFiles ? ` · ↑ ${p.uploadedFiles.toLocaleString()}` : ''
+        }`;
+        updateStep('media', 'running', detail);
+        setStatus(`Syncing media… ${p.downloadedFiles.toLocaleString()} files`);
+        // Log a milestone every 200 files so the log stays useful, not spammy.
+        if (p.downloadedFiles - lastLoggedFiles >= 200) {
+          lastLoggedFiles = p.downloadedFiles;
+          pushLog(`Media: ${p.downloadedFiles.toLocaleString()} files downloaded…`);
+        }
+      });
       const mediaDetail = `${media.files.toLocaleString()} files · ${formatBytes(media.bytes)}`;
       updateStep('media', 'done', mediaDetail);
       pushLog(`Media complete: ${mediaDetail}.`, 'ok');

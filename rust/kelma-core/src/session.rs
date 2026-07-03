@@ -5,11 +5,14 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 
 use anki::browser_table::Column;
 use anki::card::CardId;
 use anki::collection::{Collection, CollectionBuilder};
+use anki::progress::{Progress, ProgressState};
 use anki::decks::{DeckId, DeckKind};
 use anki::notetype::NotetypeId;
 use anki::prelude::{AnkiError, OrInvalid, OrNotFound};
@@ -31,6 +34,13 @@ use serde_json::{json, Value};
 /// SQLite connection, but we add a `Mutex` so the FFI surface is `Send`/`Sync`.
 pub struct KelmaSession {
     inner: Mutex<SessionState>,
+    /// Live progress cell of an in-flight background media sync (see
+    /// `sync_media_start`). Read by `sync_media_poll` without the `inner` lock,
+    /// so progress can be polled while the sync runs on its own thread.
+    media_progress: Mutex<Option<Arc<Mutex<ProgressState>>>>,
+    /// Set by the media-sync worker thread when it finishes: `Ok(totals)` or
+    /// `Err(message)`. `None` inside means still running.
+    media_done: Mutex<Option<Arc<Mutex<Option<Result<Value, String>>>>>>,
 }
 
 struct SessionState {
@@ -96,6 +106,8 @@ impl KelmaSession {
                 media_folder_path,
                 media_db_path,
             }),
+            media_progress: Mutex::new(None),
+            media_done: Mutex::new(None),
         }))
     }
 
@@ -1094,6 +1106,141 @@ impl KelmaSession {
         let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
         let (files, bytes) = media_folder_totals(&guard.media_folder_path)?;
         Ok(json!({ "files": files, "bytes": bytes }))
+    }
+
+    /// Start a media sync on a background thread and return immediately. The
+    /// blocking transfer runs on its own thread, so `sync_media_poll` can read
+    /// live progress without waiting on the session lock. Used by the UI to show
+    /// real-time counts during a large (multi-GB) media download.
+    pub fn sync_media_start(&self, request: &Value) -> Result<Value, String> {
+        let auth = sync_auth_from(request)?;
+
+        if self
+            .media_progress
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?
+            .is_some()
+        {
+            return Err("a media sync is already running".to_string());
+        }
+
+        // Build the owned media manager + progress handler under the lock, grab a
+        // handle to the shared progress cell, then release the lock.
+        let (manager, handler, progress_cell, media_folder) = {
+            let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+            let col = guard
+                .col
+                .as_mut()
+                .ok_or_else(|| "collection is not open".to_string())?;
+            let manager = col.media().map_err(|e| format!("{e:?}"))?;
+            let handler = col.new_progress_handler();
+            let progress_cell = col.shared_progress();
+            (manager, handler, progress_cell, guard.media_folder_path.clone())
+        };
+
+        let done: Arc<Mutex<Option<Result<Value, String>>>> = Arc::new(Mutex::new(None));
+        *self
+            .media_progress
+            .lock()
+            .map_err(|_| "session poisoned".to_string())? = Some(progress_cell);
+        *self
+            .media_done
+            .lock()
+            .map_err(|_| "session poisoned".to_string())? = Some(done.clone());
+
+        thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on(manager.sync_media(handler, auth, web_client(), None))
+            }));
+            let result = match outcome {
+                Ok(Ok(())) => {
+                    let (files, bytes) = media_folder_totals(&media_folder).unwrap_or((0, 0));
+                    Ok(json!({ "files": files, "bytes": bytes }))
+                }
+                Ok(Err(error)) => {
+                    let (files, bytes) = media_folder_totals(&media_folder).unwrap_or((0, 0));
+                    Err(format!(
+                        "Media sync stopped after {files} files ({bytes} bytes): {error:?}"
+                    ))
+                }
+                Err(_) => Err("media sync worker panicked".to_string()),
+            };
+            if let Ok(mut slot) = done.lock() {
+                *slot = Some(result);
+            }
+        });
+
+        Ok(json!({ "started": true }))
+    }
+
+    /// Poll an in-flight media sync. Returns `{done, checked, downloadedFiles,
+    /// downloadedDeletions, uploadedFiles, uploadedDeletions}` while running, and
+    /// once finished adds `{ok, files, bytes}` or `{ok:false, error}`.
+    pub fn sync_media_poll(&self) -> Result<Value, String> {
+        let (checked, dl_files, dl_del, up_files, up_del) = {
+            let cell = self
+                .media_progress
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            match cell.as_ref().and_then(|arc| arc.lock().ok().and_then(|s| s.last_progress)) {
+                Some(Progress::MediaSync(p)) => (
+                    p.checked,
+                    p.downloaded_files,
+                    p.downloaded_deletions,
+                    p.uploaded_files,
+                    p.uploaded_deletions,
+                ),
+                _ => (0, 0, 0, 0, 0),
+            }
+        };
+
+        let finished = {
+            let slot = self
+                .media_done
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            match slot.as_ref() {
+                Some(done_arc) => done_arc
+                    .lock()
+                    .map_err(|_| "session poisoned".to_string())?
+                    .clone(),
+                None => return Err("no media sync is running".to_string()),
+            }
+        };
+
+        if let Some(result) = finished {
+            *self
+                .media_progress
+                .lock()
+                .map_err(|_| "session poisoned".to_string())? = None;
+            *self
+                .media_done
+                .lock()
+                .map_err(|_| "session poisoned".to_string())? = None;
+            return match result {
+                Ok(totals) => Ok(json!({
+                    "done": true, "ok": true,
+                    "files": totals.get("files").cloned().unwrap_or_else(|| json!(0)),
+                    "bytes": totals.get("bytes").cloned().unwrap_or_else(|| json!(0)),
+                    "checked": checked, "downloadedFiles": dl_files,
+                    "downloadedDeletions": dl_del, "uploadedFiles": up_files,
+                    "uploadedDeletions": up_del,
+                })),
+                Err(error) => Ok(json!({
+                    "done": true, "ok": false, "error": error,
+                    "checked": checked, "downloadedFiles": dl_files,
+                    "downloadedDeletions": dl_del, "uploadedFiles": up_files,
+                    "uploadedDeletions": up_del,
+                })),
+            };
+        }
+
+        Ok(json!({
+            "done": false,
+            "checked": checked, "downloadedFiles": dl_files,
+            "downloadedDeletions": dl_del, "uploadedFiles": up_files,
+            "uploadedDeletions": up_del,
+        }))
     }
 }
 
