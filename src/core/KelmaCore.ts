@@ -197,6 +197,98 @@ export async function getStats(): Promise<Stats> {
   return runOp<Stats>('stats');
 }
 
+// --- Per-deck statistics (full rslib graph payload, like AnkiDroid) ----------
+
+/** Integer-keyed histogram, serialized as a string-keyed object by the core. */
+export type IntMap = Record<string, number>;
+
+export type DeckStatsToday = {
+  answerCount: number;
+  answerMillis: number;
+  correctCount: number;
+  matureCorrect: number;
+  matureCount: number;
+  learnCount: number;
+  reviewCount: number;
+  relearnCount: number;
+  earlyReviewCount: number;
+};
+export type StatCounts = {
+  new: number;
+  learn: number;
+  relearn: number;
+  young: number;
+  mature: number;
+  suspended: number;
+  buried: number;
+};
+export type ReviewsByType = {
+  learn: number;
+  relearn: number;
+  young: number;
+  mature: number;
+  filtered: number;
+};
+export type HourBucket = { total: number; correct: number };
+export type ButtonCounts = { learning: number[]; young: number[]; mature: number[] };
+export type TrueRetention = {
+  youngPassed: number;
+  youngFailed: number;
+  maturePassed: number;
+  matureFailed: number;
+};
+
+export type DeckStats = {
+  deckName: string;
+  days: number;
+  fsrs: boolean;
+  rolloverHour: number;
+  today?: DeckStatsToday;
+  cardCounts?: {
+    includingInactive?: StatCounts;
+    excludingInactive?: StatCounts;
+  };
+  futureDue?: { futureDue: IntMap; haveBacklog: boolean; dailyLoad: number };
+  added?: { added: IntMap };
+  intervals?: { intervals: IntMap };
+  stability?: { intervals: IntMap };
+  eases?: { eases: IntMap; average: number };
+  difficulty?: { eases: IntMap; average: number };
+  retrievability?: {
+    retrievability: IntMap;
+    average: number;
+    sumByCard: number;
+    sumByNote: number;
+  };
+  reviews?: { count: Record<string, ReviewsByType>; time: Record<string, ReviewsByType> };
+  hours?: {
+    oneMonth: HourBucket[];
+    threeMonths: HourBucket[];
+    oneYear: HourBucket[];
+    allTime: HourBucket[];
+  };
+  buttons?: {
+    oneMonth?: ButtonCounts;
+    threeMonths?: ButtonCounts;
+    oneYear?: ButtonCounts;
+    allTime?: ButtonCounts;
+  };
+  trueRetention?: {
+    today?: TrueRetention;
+    yesterday?: TrueRetention;
+    week?: TrueRetention;
+    month?: TrueRetention;
+    year?: TrueRetention;
+    allTime?: TrueRetention;
+  };
+};
+
+/** Full statistics for one deck (and its subdecks). `days` bounds the revlog
+ *  window (0 = all time), matching AnkiDroid's 1m/3m/1y/all ranges. */
+export async function getDeckStats(deckId: number, days: number): Promise<DeckStats> {
+  return runOp<DeckStats>('deckStats', { deckId, days });
+}
+
 // --- Deck inspector ----------------------------------------------------------
 
 /** Per-deck overview: the AnkiDroid StudyOptionsFragment numbers. */

@@ -348,6 +348,31 @@ impl KelmaSession {
         })
     }
 
+    /// Full per-deck statistics, scoped to a deck (and its subdecks) via the
+    /// same rslib graph engine AnkiDroid/desktop use. `request` is
+    /// `{deckId, days}` where `days` bounds the revlog window (0 = all time).
+    /// Returns every graph in `GraphsResponse` serialized to JSON.
+    pub fn deck_stats(&self, request: &Value) -> Result<Value, String> {
+        use anki::services::StatsService;
+        use anki_proto::stats::GraphsRequest;
+
+        let deck_id = DeckId(i64_field(request, "deckId")?);
+        let days = request.get("days").and_then(Value::as_u64).unwrap_or(365) as u32;
+
+        self.with_col(|col| {
+            let deck = col.get_deck(deck_id)?.or_not_found(deck_id)?;
+            let name = deck.name.human_name();
+            // `deck:"Name"` matches the deck and all of its subdecks, exactly how
+            // AnkiDroid scopes per-deck statistics.
+            let search = format!("deck:\"{}\"", name.replace('"', "\\\""));
+            let g = col.graphs(GraphsRequest {
+                search,
+                days,
+            })?;
+            Ok(graphs_to_json(&name, days, &g))
+        })
+    }
+
     /// Deck inspector: the per-deck overview AnkiDroid shows in its
     /// StudyOptionsFragment — the deck's name and description, today's due
     /// counts (new / learning / review, including subdecks, after limits), the
@@ -1567,4 +1592,164 @@ fn u64_field(value: &Value, key: &str) -> Result<u64, String> {
 #[allow(dead_code)]
 fn _usn(value: i32) -> Usn {
     Usn(value)
+}
+
+// --- Statistics serialization (GraphsResponse -> JSON) -----------------------
+// Serialize the full rslib graph payload for `deck_stats`. Maps become JSON
+// objects with stringified integer keys; the RN layer sorts them into series.
+
+fn graphs_to_json(deck_name: &str, days: u32, g: &anki_proto::stats::GraphsResponse) -> Value {
+    use anki_proto::stats::graphs_response as gr;
+
+    fn imap_i32(m: &std::collections::HashMap<i32, u32>) -> Value {
+        let mut o = serde_json::Map::new();
+        for (k, v) in m {
+            o.insert(k.to_string(), json!(v));
+        }
+        Value::Object(o)
+    }
+    fn imap_u32(m: &std::collections::HashMap<u32, u32>) -> Value {
+        let mut o = serde_json::Map::new();
+        for (k, v) in m {
+            o.insert(k.to_string(), json!(v));
+        }
+        Value::Object(o)
+    }
+    fn today(t: &gr::Today) -> Value {
+        json!({
+            "answerCount": t.answer_count,
+            "answerMillis": t.answer_millis,
+            "correctCount": t.correct_count,
+            "matureCorrect": t.mature_correct,
+            "matureCount": t.mature_count,
+            "learnCount": t.learn_count,
+            "reviewCount": t.review_count,
+            "relearnCount": t.relearn_count,
+            "earlyReviewCount": t.early_review_count,
+        })
+    }
+    fn counts(c: &gr::card_counts::Counts) -> Value {
+        json!({
+            "new": c.new_cards, "learn": c.learn, "relearn": c.relearn,
+            "young": c.young, "mature": c.mature,
+            "suspended": c.suspended, "buried": c.buried,
+        })
+    }
+    fn reviews_map(m: &std::collections::HashMap<i32, gr::review_counts_and_times::Reviews>) -> Value {
+        let mut o = serde_json::Map::new();
+        for (k, r) in m {
+            o.insert(
+                k.to_string(),
+                json!({"learn": r.learn, "relearn": r.relearn, "young": r.young, "mature": r.mature, "filtered": r.filtered}),
+            );
+        }
+        Value::Object(o)
+    }
+    fn hours(v: &[gr::hours::Hour]) -> Value {
+        Value::Array(
+            v.iter()
+                .map(|h| json!({"total": h.total, "correct": h.correct}))
+                .collect(),
+        )
+    }
+    fn buttons(b: &gr::buttons::ButtonCounts) -> Value {
+        json!({"learning": b.learning, "young": b.young, "mature": b.mature})
+    }
+    fn tr(t: &gr::true_retention_stats::TrueRetention) -> Value {
+        json!({
+            "youngPassed": t.young_passed, "youngFailed": t.young_failed,
+            "maturePassed": t.mature_passed, "matureFailed": t.mature_failed,
+        })
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("deckName".into(), json!(deck_name));
+    out.insert("days".into(), json!(days));
+    out.insert("fsrs".into(), json!(g.fsrs));
+    out.insert("rolloverHour".into(), json!(g.rollover_hour));
+
+    if let Some(t) = &g.today {
+        out.insert("today".into(), today(t));
+    }
+    if let Some(cc) = &g.card_counts {
+        out.insert(
+            "cardCounts".into(),
+            json!({
+                "includingInactive": cc.including_inactive.as_ref().map(counts),
+                "excludingInactive": cc.excluding_inactive.as_ref().map(counts),
+            }),
+        );
+    }
+    if let Some(fd) = &g.future_due {
+        out.insert(
+            "futureDue".into(),
+            json!({
+                "futureDue": imap_i32(&fd.future_due),
+                "haveBacklog": fd.have_backlog,
+                "dailyLoad": fd.daily_load,
+            }),
+        );
+    }
+    if let Some(a) = &g.added {
+        out.insert("added".into(), json!({ "added": imap_i32(&a.added) }));
+    }
+    if let Some(i) = &g.intervals {
+        out.insert("intervals".into(), json!({ "intervals": imap_u32(&i.intervals) }));
+    }
+    if let Some(s) = &g.stability {
+        out.insert("stability".into(), json!({ "intervals": imap_u32(&s.intervals) }));
+    }
+    if let Some(e) = &g.eases {
+        out.insert("eases".into(), json!({ "eases": imap_u32(&e.eases), "average": e.average }));
+    }
+    if let Some(d) = &g.difficulty {
+        out.insert("difficulty".into(), json!({ "eases": imap_u32(&d.eases), "average": d.average }));
+    }
+    if let Some(r) = &g.retrievability {
+        out.insert(
+            "retrievability".into(),
+            json!({
+                "retrievability": imap_u32(&r.retrievability),
+                "average": r.average, "sumByCard": r.sum_by_card, "sumByNote": r.sum_by_note,
+            }),
+        );
+    }
+    if let Some(rv) = &g.reviews {
+        out.insert(
+            "reviews".into(),
+            json!({ "count": reviews_map(&rv.count), "time": reviews_map(&rv.time) }),
+        );
+    }
+    if let Some(h) = &g.hours {
+        out.insert(
+            "hours".into(),
+            json!({
+                "oneMonth": hours(&h.one_month), "threeMonths": hours(&h.three_months),
+                "oneYear": hours(&h.one_year), "allTime": hours(&h.all_time),
+            }),
+        );
+    }
+    if let Some(b) = &g.buttons {
+        out.insert(
+            "buttons".into(),
+            json!({
+                "oneMonth": b.one_month.as_ref().map(buttons),
+                "threeMonths": b.three_months.as_ref().map(buttons),
+                "oneYear": b.one_year.as_ref().map(buttons),
+                "allTime": b.all_time.as_ref().map(buttons),
+            }),
+        );
+    }
+    if let Some(t) = &g.true_retention {
+        out.insert(
+            "trueRetention".into(),
+            json!({
+                "today": t.today.as_ref().map(tr), "yesterday": t.yesterday.as_ref().map(tr),
+                "week": t.week.as_ref().map(tr), "month": t.month.as_ref().map(tr),
+                "year": t.year.as_ref().map(tr), "allTime": t.all_time.as_ref().map(tr),
+            }),
+        );
+    }
+
+    Value::Object(out)
 }

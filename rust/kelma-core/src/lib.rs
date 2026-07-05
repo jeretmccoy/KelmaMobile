@@ -333,6 +333,7 @@ fn dispatch_session(session: &KelmaSession, op: &str, input: &[u8]) -> Result<St
         "undoStatus" => session.undo_status()?,
         "undo" => session.undo()?,
         "stats" => session.stats()?,
+        "deckStats" => session.deck_stats(&request)?,
         "deckOverview" => session.deck_overview(&request)?,
         "browseDeck" => session.browse_deck(&request)?,
         "cardDetail" => session.card_detail(&request)?,
