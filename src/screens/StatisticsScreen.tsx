@@ -11,11 +11,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Modal,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import {
@@ -153,25 +155,8 @@ export function StatisticsScreen({ reloadToken }: Props) {
         <Text style={styles.title}>Statistics</Text>
       </View>
 
-      {/* Deck picker */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.chipRow}>
-        {decks.map(d => (
-          <Pressable
-            key={d.deckId}
-            onPress={() => setSelected(d.deckId)}
-            style={[styles.chip, selected === d.deckId && styles.chipActive]}>
-            <Text
-              style={[styles.chipText, selected === d.deckId && styles.chipTextActive]}
-              numberOfLines={1}>
-              {'· '.repeat(d.level)}
-              {d.leaf}
-            </Text>
-          </Pressable>
-        ))}
-      </ScrollView>
+      {/* Deck picker (searchable dropdown) */}
+      <DeckPicker decks={decks} selected={selected} onSelect={setSelected} />
 
       {/* Period selector */}
       <View style={styles.periodRow}>
@@ -196,6 +181,74 @@ export function StatisticsScreen({ reloadToken }: Props) {
 
       {stats && <StatsBody stats={stats} />}
     </ScrollView>
+  );
+}
+
+function DeckPicker({
+  decks,
+  selected,
+  onSelect,
+}: {
+  decks: FlatDeck[];
+  selected: number | null;
+  onSelect: (id: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const current = decks.find(d => d.deckId === selected);
+  const q = query.trim().toLowerCase();
+  const filtered = q ? decks.filter(d => d.name.toLowerCase().includes(q)) : decks;
+
+  return (
+    <>
+      <Pressable
+        style={styles.dropdown}
+        onPress={() => {
+          setQuery('');
+          setOpen(true);
+        }}>
+        <Text style={styles.dropdownText} numberOfLines={1}>
+          {current ? current.name : 'Select a deck'}
+        </Text>
+        <Text style={styles.dropdownChevron}>▾</Text>
+      </Pressable>
+
+      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setOpen(false)}>
+          <Pressable style={styles.modalCard} onPress={() => {}}>
+            <TextInput
+              style={styles.search}
+              placeholder="Search decks…"
+              placeholderTextColor={palette.textMuted}
+              autoFocus
+              autoCapitalize="none"
+              autoCorrect={false}
+              value={query}
+              onChangeText={setQuery}
+            />
+            <ScrollView style={styles.deckList} keyboardShouldPersistTaps="handled">
+              {filtered.map(d => (
+                <Pressable
+                  key={d.deckId}
+                  style={styles.deckItem}
+                  onPress={() => {
+                    onSelect(d.deckId);
+                    setOpen(false);
+                  }}>
+                  <Text
+                    style={[styles.deckItemText, selected === d.deckId && styles.deckItemActive]}
+                    numberOfLines={1}>
+                    {'   '.repeat(d.level)}
+                    {d.leaf}
+                  </Text>
+                </Pressable>
+              ))}
+              {filtered.length === 0 && <Text style={styles.deckEmpty}>No decks match “{query}”.</Text>}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </>
   );
 }
 
@@ -599,19 +652,50 @@ const styles = StyleSheet.create({
   center: { paddingVertical: 30, alignItems: 'center' },
   error: { color: palette.bad, fontSize: 14, marginTop: 8 },
 
-  chipRow: { gap: 8, paddingBottom: 4, paddingRight: 8 },
-  chip: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 999,
+  dropdown: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: radius.md,
     backgroundColor: palette.surface,
     borderColor: palette.surfaceBorder,
     borderWidth: 1,
-    maxWidth: 200,
   },
-  chipActive: { backgroundColor: palette.surfaceHigh, borderColor: palette.gold },
-  chipText: { color: palette.textSecondary, fontSize: 14, fontWeight: '600' },
-  chipTextActive: { color: palette.textPrimary },
+  dropdownText: { color: palette.textPrimary, fontSize: 16, fontWeight: '600', flex: 1 },
+  dropdownChevron: { color: palette.textMuted, fontSize: 16, marginLeft: 10 },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  modalCard: {
+    backgroundColor: palette.surfaceElevated,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    maxHeight: '70%',
+    ...shadow.card,
+  },
+  search: {
+    backgroundColor: palette.background,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: radius.sm,
+    color: palette.textPrimary,
+    fontSize: 15,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    marginBottom: 8,
+  },
+  deckList: { flexGrow: 0 },
+  deckItem: { paddingVertical: 12, paddingHorizontal: 6 },
+  deckItemText: { color: palette.textSecondary, fontSize: 15 },
+  deckItemActive: { color: palette.gold, fontWeight: '700' },
+  deckEmpty: { color: palette.textMuted, fontSize: 14, padding: 14, textAlign: 'center' },
 
   periodRow: { flexDirection: 'row', gap: 8, marginTop: 14, marginBottom: 6 },
   period: {
