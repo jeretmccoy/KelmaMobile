@@ -82,8 +82,17 @@ function App() {
         setDeckReloadToken(token => token + 1);
       })
       .catch(error => {
+        const msg = error instanceof Error ? error.message : String(error);
+        // A full sync needs an explicit upload/download choice — send the user
+        // to the Sync screen to make it, rather than failing or picking blindly.
+        if (msg === 'FULL_SYNC_REQUIRED') {
+          setSyncState('idle');
+          setSyncStatus(null);
+          setScreen({ name: 'sync' });
+          return;
+        }
         setSyncState('error');
-        setSyncStatus(error instanceof Error ? error.message : 'Sync failed.');
+        setSyncStatus(msg);
       });
   }, [syncAuth]);
 

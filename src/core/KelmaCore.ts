@@ -527,7 +527,11 @@ export async function getSyncDebug(): Promise<SyncDebug> {
 export async function runSyncNow(auth: SyncAuth): Promise<string> {
   const outcome = await syncCollection(auth);
   if (outcome.required === 'fullSyncRequired') {
-    await fullSync(auth, outcome.downloadOk ? false : true);
+    // A full sync replaces one side wholesale (data loss risk — this is what
+    // reverted freshly-reviewed cards to "new"). The headless home button must
+    // not pick a direction; signal the app to open the Sync screen so the user
+    // chooses upload vs download.
+    throw new Error('FULL_SYNC_REQUIRED');
   }
   const media = await syncMedia(auth);
   const collectionSummary =

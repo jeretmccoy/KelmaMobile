@@ -177,16 +177,35 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
         const outcome = await syncCollection(credentials);
         pushLog(`Server says: ${outcome.required}.`);
         if (outcome.required === 'fullSyncRequired') {
-          const download = outcome.downloadOk;
-          const label = download ? 'Downloading collection…' : 'Uploading collection…';
+          // A full sync REPLACES one side wholesale — never pick a direction
+          // silently, or a just-made local change (e.g. a review) gets wiped by
+          // the server's copy. Ask; the safe choice keeps this device's work.
+          const choice = await promptFullSyncDirection(outcome.uploadOk, outcome.downloadOk);
+          if (choice === 'cancel') {
+            updateStep('collection', 'done', 'Full sync needed — not run');
+            setStatus('Full sync needed — choose Upload or Download to continue. Nothing was changed.');
+            pushLog('Full sync required; cancelled — collection and media left untouched.', 'error');
+            return;
+          }
+          const upload = choice === 'upload';
+          const label = upload ? 'Uploading collection…' : 'Downloading collection…';
           updateStep('collection', 'running', label);
-          setStatus(download ? 'Downloading the full collection…' : 'Uploading the full collection…');
+          setStatus(upload ? 'Uploading the full collection…' : 'Downloading the full collection…');
           pushLog(
-            download
-              ? 'Full sync required — downloading from server…'
-              : 'Full sync required — uploading to server…',
+            upload
+              ? 'Full sync — uploading this device to the server…'
+              : 'Full sync — replacing this device with the server copy…',
           );
-          await fullSyncMonitored(credentials, !download, onFull(label));
+          await fullSyncMonitored(credentials, upload, onFull(label));
+          // If we replaced local with the server copy, clear local media so the
+          // media phase downloads the server's files instead of re-uploading.
+          if (!upload) {
+            try {
+              await resetMedia();
+            } catch {
+              pushLog('Could not clear local media after download.', 'error');
+            }
+          }
           updateStep('collection', 'done', 'Full collection transfer complete');
           pushLog('Full collection transfer complete.', 'ok');
         } else {
@@ -487,6 +506,40 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
       </ScrollView>
     </KeyboardAvoidingView>
   );
+}
+
+type FullSyncChoice = 'upload' | 'download' | 'cancel';
+
+// When the server can't merge (schema diverged), one side's changes are kept and
+// the other discarded. Make the user choose — silently downloading here is what
+// wiped freshly-reviewed cards back to "new".
+function promptFullSyncDirection(
+  uploadOk: boolean,
+  downloadOk: boolean,
+): Promise<FullSyncChoice> {
+  return new Promise(resolve => {
+    const buttons: Parameters<typeof Alert.alert>[2] = [];
+    if (uploadOk) {
+      buttons.push({ text: 'Upload — keep this device', onPress: () => resolve('upload') });
+    }
+    if (downloadOk) {
+      buttons.push({
+        text: 'Download — replace this device',
+        style: 'destructive',
+        onPress: () => resolve('download'),
+      });
+    }
+    buttons.push({ text: 'Cancel', style: 'cancel', onPress: () => resolve('cancel') });
+    Alert.alert(
+      'Full sync required',
+      'This device and the server have diverged and can’t be merged automatically. ' +
+        'One side is kept and the other discarded:\n\n' +
+        '• Upload keeps THIS device (including your latest reviews) and overwrites the server.\n' +
+        '• Download replaces THIS device with the server’s copy.',
+      buttons,
+      { cancelable: true, onDismiss: () => resolve('cancel') },
+    );
+  });
 }
 
 function formatClock(ts: number): string {
