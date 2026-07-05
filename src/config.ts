@@ -17,11 +17,10 @@ export const DEFAULT_SYNC_ENDPOINT = 'https://sync.kelma.tech';
 
 /**
  * Where users create a Kelma account. Account creation is owned by Kelma
- * Immersion (the web app, currently ankiai.tech, moving to kelma.tech) — the
- * app links out here for sign-up and only signs in with the resulting
- * email + password. Kept as one constant for an easy swap at rebrand.
+ * Immersion (the web app at kelma.tech) — the app links out here for sign-up
+ * and only signs in with the resulting email + password.
  */
-export const KELMA_SIGNUP_URL = 'https://ankiai.tech';
+export const KELMA_SIGNUP_URL = 'https://kelma.tech';
 
 /**
  * The client version string reported to the sync server. Tracks the pinned

@@ -34,6 +34,10 @@ type Props = {
   /** Called once after a successful sign-in, so credentials can be persisted
    *  for the home Sync button. */
   onSignedIn: (auth: SyncAuth) => void;
+  /** Credentials already persisted for this profile (loaded by the app shell
+   *  from the collection config). When present the screen starts signed-in and
+   *  shows "Sync now" instead of re-prompting for a login the user already did. */
+  initialAuth?: SyncAuth | null;
 };
 
 type StepState = 'pending' | 'running' | 'done' | 'error';
@@ -63,10 +67,10 @@ const INITIAL_STEPS: SyncStep[] = [
 type LogLevel = 'info' | 'ok' | 'error';
 type LogEntry = { id: number; ts: number; text: string; level: LogLevel };
 
-export function SyncScreen({ onSynced, onSignedIn }: Props) {
+export function SyncScreen({ onSynced, onSignedIn, initialAuth }: Props) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [auth, setAuth] = useState<SyncAuth | null>(null);
+  const [auth, setAuth] = useState<SyncAuth | null>(initialAuth ?? null);
   const [status, setStatus] = useState('Sign in to sync your collection and media.');
   const [busy, setBusy] = useState(false);
   const [steps, setSteps] = useState<SyncStep[]>(INITIAL_STEPS);
@@ -87,6 +91,14 @@ export function SyncScreen({ onSynced, onSignedIn }: Props) {
     const id = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(id);
   }, [busy]);
+
+  // The app shell loads persisted credentials asynchronously (after the
+  // collection opens), so they can arrive after this screen has mounted with a
+  // null `auth`. Adopt them once — without clobbering a sign-in done here — so
+  // the user is never asked to log in again for a session they already have.
+  useEffect(() => {
+    if (initialAuth) setAuth(prev => prev ?? initialAuth);
+  }, [initialAuth]);
   const elapsedSec = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
 
   // Client-side gate for the submit button when not already signed in.

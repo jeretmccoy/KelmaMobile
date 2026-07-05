@@ -6,9 +6,11 @@
  * collection, then hands off to decks, sync, settings, or the reviewer.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
+  Alert,
+  Linking,
   Pressable,
   StatusBar,
   StyleSheet,
@@ -16,15 +18,19 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import { getCoreInfo, getStoredSyncAuth, openProfile, runSyncNow, selectDeck, storeSyncAuth, type SyncAuth } from './src/core/KelmaCore';
+import { getCoreInfo, getStoredSyncAuth, importApkg, openProfile, runSyncNow, selectDeck, storeSyncAuth, type SyncAuth } from './src/core/KelmaCore';
+import { copyUriToTempPath, downloadUrlToTempPath, looksLikeApkgUrl, pickFile } from './src/core/Share';
 import { CardDetailScreen } from './src/screens/CardDetailScreen';
 import { DeckInspectorScreen } from './src/screens/DeckInspectorScreen';
+import { NoteEditorScreen } from './src/screens/NoteEditorScreen';
+import { AddNoteScreen } from './src/screens/AddNoteScreen';
 import { DeckListScreen } from './src/screens/DeckListScreen';
 import { ReviewerScreen } from './src/screens/ReviewerScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { StatisticsScreen } from './src/screens/StatisticsScreen';
 import { SyncScreen } from './src/screens/SyncScreen';
-import { palette } from './src/screens/theme';
+import { palette, radius, spacing } from './src/screens/theme';
+import { DeckIcon, SettingsIcon, StatsIcon, SyncIcon } from './src/screens/TabIcons';
 
 type Boot =
   | { kind: 'loading' }
@@ -36,7 +42,15 @@ type Screen =
   | { name: MainScreen }
   | { name: 'review'; deckId: number; deckName: string }
   | { name: 'deckInspector'; deckId: number; deckName: string }
-  | { name: 'cardDetail'; cardId: number; deckId: number; deckName: string };
+  | { name: 'cardDetail'; cardId: number; deckId: number; deckName: string }
+  | {
+      name: 'noteEditor';
+      cardId: number;
+      returnTo: 'review' | 'cardDetail';
+      deckId: number;
+      deckName: string;
+    }
+  | { name: 'addNote'; deckId: number; deckName: string };
 
 function App() {
   const [boot, setBoot] = useState<Boot>({ kind: 'loading' });
@@ -123,6 +137,136 @@ function App() {
 
   useEffect(start, [start]);
 
+  // --- Import from .apkg ---------------------------------------------------
+  // Two entry points feed the same importer:
+  //   1. A deep link: the OS launched Kelma with a file:// (iOS) or
+  //      content:// (Android) URI for an .apkg. Linking surfaces it via
+  //      getInitialURL() and the url event.
+  //   2. An explicit Import button in the deck list that opens the OS file
+  //      picker.
+  // Both resolve to a real filesystem path (copied into the app temp/cache
+  // dir, since rslib opens by path and cannot take a security-scoped or
+  // content:// URI directly), then call rslib import_apkg.
+  const [importing, setImporting] = useState(false);
+  // Guard against re-importing the same launch URL twice (initial URL + event).
+  const [handledUrl, setHandledUrl] = useState<string | null>(null);
+
+  const runImport = useCallback(
+    (path: string) => {
+      if (!path || importing) {
+        return;
+      }
+      setImporting(true);
+      importApkg(path)
+        .then(result => {
+          setDeckReloadToken(token => token + 1);
+          const parts: string[] = [];
+          if (result.added) {
+            parts.push(`${result.added} added`);
+          }
+          if (result.updated) {
+            parts.push(`${result.updated} updated`);
+          }
+          const skipped = result.duplicates + result.conflicts;
+          if (skipped) {
+            parts.push(`${skipped} skipped`);
+          }
+          Alert.alert(
+            'Import complete',
+            parts.length
+              ? `${parts.join(' · ')}${result.foundNotes ? `\nof ${result.foundNotes} notes` : ''}.`
+              : 'No new notes were found in the package.',
+          );
+        })
+        .catch(error => {
+          Alert.alert(
+            'Import failed',
+            error instanceof Error ? error.message : 'Could not import the package.',
+          );
+        })
+        .finally(() => setImporting(false));
+    },
+    [importing],
+  );
+
+  const importFromUri = useCallback(
+    (uri: string) => {
+      if (!uri || uri === handledUrl) {
+        return;
+      }
+      setHandledUrl(uri);
+      // Route by scheme: remote http(s) URLs are downloaded, local file/content
+      // URIs are copied. Both resolve to a filesystem path rslib can import.
+      const fetchPath = /^https?:\/\//i.test(uri)
+        ? downloadUrlToTempPath(uri)
+        : copyUriToTempPath(uri);
+      fetchPath
+        .then(runImport)
+        .catch(error =>
+          Alert.alert(
+            'Import failed',
+            error instanceof Error ? error.message : 'Could not read the shared file.',
+          ),
+        );
+    },
+    [handledUrl, runImport],
+  );
+
+  // Import an .apkg the app was launched/opened with.
+  useEffect(() => {
+    if (boot.kind !== 'ready') {
+      return;
+    }
+    Linking.getInitialURL()
+      .then(url => {
+        if (url && looksLikeApkgUrl(url)) {
+          importFromUri(url);
+        }
+      })
+      .catch(() => {});
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      if (looksLikeApkgUrl(url)) {
+        importFromUri(url);
+      }
+    });
+    return () => sub.remove();
+  }, [boot.kind, importFromUri]);
+
+  const importFromPicker = useCallback(() => {
+    pickFile()
+      .then(path => {
+        if (path) {
+          runImport(path);
+        }
+      })
+      .catch(error =>
+        Alert.alert(
+          'Import failed',
+          error instanceof Error ? error.message : 'Could not open the file picker.',
+        ),
+      );
+  }, [runImport]);
+
+  // Download an .apkg from a pasted remote URL (Import from URL sheet).
+  const importFromUrl = useCallback(
+    (url: string) => {
+      const trimmed = url.trim();
+      if (!/^https?:\/\//i.test(trimmed)) {
+        Alert.alert('Import failed', 'Enter a full http(s) URL to an .apkg file.');
+        return;
+      }
+      downloadUrlToTempPath(trimmed)
+        .then(runImport)
+        .catch(error =>
+          Alert.alert(
+            'Import failed',
+            error instanceof Error ? error.message : 'Could not download the file.',
+          ),
+        );
+    },
+    [runImport],
+  );
+
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={palette.background} />
@@ -136,7 +280,7 @@ function App() {
 
         {boot.kind === 'error' && (
           <View style={styles.center}>
-            <Text style={styles.eyebrow}>KELMA</Text>
+            <Text style={styles.eyebrow}>Kelma</Text>
             <Text style={styles.errorTitle}>Core not linked</Text>
             <Text style={styles.errorBody}>{boot.reason}</Text>
             <Pressable onPress={start} style={styles.retry}>
@@ -150,6 +294,15 @@ function App() {
             <ReviewerScreen
               deckName={screen.deckName}
               autoplayAudio={autoplayAudio}
+              onEditCard={cardId =>
+                setScreen({
+                  name: 'noteEditor',
+                  cardId,
+                  returnTo: 'review',
+                  deckId: screen.deckId,
+                  deckName: screen.deckName,
+                })
+              }
               onBack={() => {
                 setScreen({ name: 'deckInspector', deckId: screen.deckId, deckName: screen.deckName });
                 setDeckReloadToken(token => token + 1);
@@ -168,6 +321,9 @@ function App() {
                   deckName: screen.deckName,
                 })
               }
+              onAdd={() =>
+                setScreen({ name: 'addNote', deckId: screen.deckId, deckName: screen.deckName })
+              }
               onBack={() => setScreen({ name: 'decks' })}
               reloadToken={deckReloadToken}
             />
@@ -175,7 +331,48 @@ function App() {
             <CardDetailScreen
               cardId={screen.cardId}
               deckName={screen.deckName}
-              onBack={() =>
+              onEditCard={cardId =>
+                setScreen({
+                  name: 'noteEditor',
+                  cardId,
+                  returnTo: 'cardDetail',
+                  deckId: screen.deckId,
+                  deckName: screen.deckName,
+                })
+              }
+              onChanged={() => setDeckReloadToken(token => token + 1)}
+              onBack={() => {
+                setDeckReloadToken(token => token + 1);
+                setScreen({
+                  name: 'deckInspector',
+                  deckId: screen.deckId,
+                  deckName: screen.deckName,
+                });
+              }}
+            />
+          ) : screen.name === 'noteEditor' ? (
+            <NoteEditorScreen
+              cardId={screen.cardId}
+              onSaved={() => setDeckReloadToken(token => token + 1)}
+              onClose={() =>
+                setScreen(
+                  screen.returnTo === 'review'
+                    ? { name: 'review', deckId: screen.deckId, deckName: screen.deckName }
+                    : {
+                        name: 'cardDetail',
+                        cardId: screen.cardId,
+                        deckId: screen.deckId,
+                        deckName: screen.deckName,
+                      },
+                )
+              }
+            />
+          ) : screen.name === 'addNote' ? (
+            <AddNoteScreen
+              deckId={screen.deckId}
+              deckName={screen.deckName}
+              onSaved={() => setDeckReloadToken(token => token + 1)}
+              onClose={() =>
                 setScreen({
                   name: 'deckInspector',
                   deckId: screen.deckId,
@@ -193,8 +390,9 @@ function App() {
                 <DeckListScreen
                   onOpenDeck={openDeck}
                   onSyncNow={syncNow}
-                  onOpenSync={() => setScreen({ name: 'sync' })}
-                  onOpenSettings={() => setScreen({ name: 'settings' })}
+                  onImport={importFromPicker}
+                  onImportUrl={importFromUrl}
+                  importing={importing}
                   reloadToken={deckReloadToken}
                   syncState={syncState}
                   syncStatus={syncStatus}
@@ -215,6 +413,7 @@ function App() {
                 <SyncScreen
                   onSynced={() => setDeckReloadToken(token => token + 1)}
                   onSignedIn={onSignedIn}
+                  initialAuth={syncAuth}
                 />
               </View>
               <View
@@ -245,11 +444,16 @@ function MainTabBar({
   active: MainScreen;
   onSelect: (screen: MainScreen) => void;
 }) {
-  const tabs: { name: MainScreen; icon: string; label: string }[] = [
-    { name: 'decks', icon: '▤', label: 'Decks' },
-    { name: 'stats', icon: '▦', label: 'Stats' },
-    { name: 'sync', icon: '↻', label: 'Sync' },
-    { name: 'settings', icon: '⚙', label: 'Settings' },
+  const tabs: {
+    name: MainScreen;
+    glyph?: string;
+    Icon?: (props: { color: string }) => ReactNode;
+    label: string;
+  }[] = [
+    { name: 'decks', Icon: DeckIcon, label: 'Decks' },
+    { name: 'stats', Icon: StatsIcon, label: 'Stats' },
+    { name: 'sync', Icon: SyncIcon, label: 'KelmaSync' },
+    { name: 'settings', Icon: SettingsIcon, label: 'Settings' },
   ];
 
   return (
@@ -263,9 +467,15 @@ function MainTabBar({
             accessibilityState={{ selected }}
             onPress={() => onSelect(tab.name)}
             style={styles.tab}>
-            <Text style={[styles.tabIcon, selected && styles.tabSelected]}>
-              {tab.icon}
-            </Text>
+            <View style={[styles.tabIcon, selected && styles.tabIconActive]}>
+              {tab.Icon ? (
+                <tab.Icon color={selected ? palette.background : palette.textMuted} />
+              ) : (
+                <Text style={[styles.tabIconGlyph, selected && styles.tabGlyphSelected]}>
+                  {tab.glyph}
+                </Text>
+              )}
+            </View>
             <Text style={[styles.tabLabel, selected && styles.tabSelected]}>
               {tab.label}
             </Text>
@@ -285,36 +495,49 @@ const styles = StyleSheet.create({
   muted: { color: palette.textSecondary, fontSize: 14 },
   eyebrow: {
     color: palette.gold,
-    fontSize: 13,
+    fontSize: 15,
     fontWeight: '800',
-    letterSpacing: 3.2,
+    letterSpacing: 0.2,
   },
-  errorTitle: { color: palette.textPrimary, fontSize: 24, fontWeight: '700' },
+  errorTitle: { color: palette.textPrimary, fontSize: 24, fontWeight: '800' },
   errorBody: { color: palette.textSecondary, fontSize: 14, lineHeight: 21, textAlign: 'center' },
   retry: {
-    borderColor: palette.surfaceBorder,
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    backgroundColor: palette.gold,
+    borderRadius: radius.md,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
     marginTop: 6,
   },
-  retryText: { color: palette.goldSoft, fontSize: 14, fontWeight: '700' },
+  retryText: { color: palette.background, fontSize: 15, fontWeight: '800' },
   tabBar: {
     flexDirection: 'row',
-    minHeight: 62,
-    backgroundColor: palette.surface,
-    borderTopColor: palette.surfaceBorder,
+    minHeight: 64,
+    // Same colour as the canvas so it flows seamlessly into the bottom safe
+    // area (home indicator) instead of showing a two-tone band; a hairline is
+    // the only separator from content.
+    backgroundColor: palette.background,
+    borderTopColor: palette.hairline,
     borderTopWidth: 1,
-    paddingBottom: 3,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.xs,
   },
-  tab: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  tabIcon: { color: palette.textMuted, fontSize: 21, lineHeight: 24 },
+  tab: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 3 },
+  tabIcon: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 30,
+    minWidth: 52,
+    borderRadius: radius.pill,
+    paddingHorizontal: 14,
+    paddingVertical: 4,
+  },
+  tabIconActive: { backgroundColor: palette.gold },
+  tabIconGlyph: { color: palette.textMuted, fontSize: 20, lineHeight: 24 },
+  tabGlyphSelected: { color: palette.background },
   tabLabel: {
     color: palette.textMuted,
     fontSize: 11,
     fontWeight: '700',
-    marginTop: 2,
   },
   tabSelected: { color: palette.goldSoft },
 });
