@@ -60,7 +60,21 @@ struct SessionState {
 /// Build the reqwest client rslib expects for sync. It must be the same
 /// `reqwest` version rslib links against (see Cargo.toml pinning note).
 fn web_client() -> reqwest::Client {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
     reqwest::Client::builder()
+        // Force IPv4. iOS's URLSession (what Safari uses) does Happy Eyeballs —
+        // it races IPv4 and IPv6 and uses whichever connects — but reqwest/hyper
+        // connects to the first resolved address, usually the IPv6 one. On a
+        // network whose IPv6 route to the sync host is a black hole (common on
+        // some carriers / captive Wi-Fi), that connect just hangs until the TCP
+        // timeout (~75s) with no IPv4 fallback, so sync "times out" even though
+        // the same host loads instantly in Safari. Binding a local IPv4 address
+        // makes every sync connection use the A record.
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        // And cap connect time so a genuinely dead route fails fast and legibly
+        // instead of a silent ~75s hang.
+        .connect_timeout(Duration::from_secs(20))
         .build()
         .expect("failed to build sync HTTP client")
 }

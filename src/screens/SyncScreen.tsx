@@ -38,6 +38,10 @@ type Props = {
    *  from the collection config). When present the screen starts signed-in and
    *  shows "Sync now" instead of re-prompting for a login the user already did. */
   initialAuth?: SyncAuth | null;
+  /** Forget the persisted credentials (sign out), so the login form returns —
+   *  used both by the explicit "Sign out" control and automatically when the
+   *  server rejects the stored key. */
+  onSignedOut: () => void;
 };
 
 type StepState = 'pending' | 'running' | 'done' | 'error';
@@ -67,7 +71,7 @@ const INITIAL_STEPS: SyncStep[] = [
 type LogLevel = 'info' | 'ok' | 'error';
 type LogEntry = { id: number; ts: number; text: string; level: LogLevel };
 
-export function SyncScreen({ onSynced, onSignedIn, initialAuth }: Props) {
+export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: Props) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [auth, setAuth] = useState<SyncAuth | null>(initialAuth ?? null);
@@ -273,8 +277,18 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth }: Props) {
                 : step,
             ),
           );
-          setStatus(`Failed: ${message}`);
-          pushLog(message, 'error');
+          // A rejected host key (server 403) means the stored session is no
+          // longer valid — forget it and drop back to the login form so the user
+          // can re-authenticate, instead of being stuck "signed in" with a key
+          // the server won't accept.
+          if (/\b403\b|forbidden|invalid host key|host key/i.test(message)) {
+            setStatus('Your sync session expired — please sign in again.');
+            pushLog('Session rejected by server (403). Signing out.', 'error');
+            signOut();
+          } else {
+            setStatus(`Failed: ${message}`);
+            pushLog(message, 'error');
+          }
         })
         .finally(() => setBusy(false));
     },
@@ -282,6 +296,15 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth }: Props) {
   );
 
   const sync = () => start(false);
+
+  // Forget the stored credentials and return to the login form. Used by the
+  // explicit control and automatically when the server rejects the stored key.
+  const signOut = useCallback(() => {
+    setAuth(null);
+    setEmail('');
+    setPassword('');
+    onSignedOut();
+  }, [onSignedOut]);
 
   const resetFromServer = () => {
     Alert.alert(
@@ -352,7 +375,17 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth }: Props) {
           )}
 
           {auth && (
-            <Text style={styles.signedIn}>Signed in for this app session.</Text>
+            <View style={styles.signedInRow}>
+              <Text style={styles.signedIn}>Signed in.</Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Sign out"
+                onPress={signOut}
+                disabled={busy}
+                hitSlop={8}>
+                <Text style={[styles.signOutLink, busy && styles.disabled]}>Sign out</Text>
+              </Pressable>
+            </View>
           )}
 
           <View style={styles.progress}>
@@ -522,10 +555,21 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     marginBottom: 12,
   },
+  signedInRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
   signedIn: {
     color: palette.good,
     fontSize: 14,
-    marginBottom: 10,
+  },
+  signOutLink: {
+    color: palette.textMuted,
+    fontSize: 13,
+    fontWeight: '600',
+    textDecorationLine: 'underline',
   },
   progress: {
     borderTopColor: palette.surfaceBorder,

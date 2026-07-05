@@ -35,7 +35,7 @@ test('shows collection and media progress with final on-disk totals', async () =
   let renderer!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
     renderer = ReactTestRenderer.create(
-      <SyncScreen onSynced={jest.fn()} onSignedIn={jest.fn()} />,
+      <SyncScreen onSynced={jest.fn()} onSignedIn={jest.fn()} onSignedOut={jest.fn()} />,
     );
   });
 
@@ -63,7 +63,7 @@ test('starts signed-in when credentials are already persisted (no re-login)', as
     renderer = ReactTestRenderer.create(
       <SyncScreen
         onSynced={jest.fn()}
-        onSignedIn={jest.fn()}
+        onSignedIn={jest.fn()} onSignedOut={jest.fn()}
         initialAuth={{ hkey: 'key', endpoint: 'http://127.0.0.1:8080' }}
       />,
     );

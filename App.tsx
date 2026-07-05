@@ -18,7 +18,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import { getCoreInfo, getStoredSyncAuth, importApkg, openProfile, runSyncNow, selectDeck, storeSyncAuth, type SyncAuth } from './src/core/KelmaCore';
+import { clearStoredSyncAuth, getCoreInfo, getStoredSyncAuth, importApkg, openProfile, runSyncNow, selectDeck, storeSyncAuth, type SyncAuth } from './src/core/KelmaCore';
 import { copyUriToTempPath, downloadUrlToTempPath, looksLikeApkgUrl, pickFile } from './src/core/Share';
 import { CardDetailScreen } from './src/screens/CardDetailScreen';
 import { DeckInspectorScreen } from './src/screens/DeckInspectorScreen';
@@ -92,6 +92,11 @@ function App() {
     storeSyncAuth(auth).catch(() => {
       // best-effort persistence; in-memory auth still works for this session
     });
+  }, []);
+
+  const onSignedOut = useCallback(() => {
+    setSyncAuth(null);
+    clearStoredSyncAuth().catch(() => {});
   }, []);
 
   // Tap a deck -> open its inspector (overview + browse), the AnkiDroid
@@ -413,6 +418,7 @@ function App() {
                 <SyncScreen
                   onSynced={() => setDeckReloadToken(token => token + 1)}
                   onSignedIn={onSignedIn}
+                  onSignedOut={onSignedOut}
                   initialAuth={syncAuth}
                 />
               </View>
