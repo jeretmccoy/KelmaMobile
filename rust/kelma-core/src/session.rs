@@ -879,13 +879,20 @@ impl KelmaSession {
             let last_ms: i64 = db
                 .query_row("select ls from col", [], |row| row.get(0))
                 .unwrap_or(0);
-            let last_sec = last_ms / 1000;
 
-            // added: cards created after the last sync (card id is creation ms)
+            // Only count cards pending UPLOAD — i.e. locally modified since the
+            // last sync, which Anki marks with `usn = -1`. Cards DOWNLOADED from
+            // the server arrive with the server's usn (>= 0), so they're excluded
+            // here (they're already in KelmaSync). The earlier heuristic keyed off
+            // creation/mod time vs. the last-sync stamp, which wrongly flagged
+            // freshly downloaded cards (created on another device after this
+            // device's previous sync) as pending.
+
+            // added: locally-created cards not yet uploaded (card id is creation ms)
             let mut added: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-            if last_ms > 0 {
+            {
                 let mut stmt = db.prepare(
-                    "select did, count(*) from cards where id > ? group by did",
+                    "select did, count(*) from cards where usn = -1 and id > ? group by did",
                 )?;
                 let rows = stmt.query_map(params![last_ms], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
@@ -897,13 +904,13 @@ impl KelmaSession {
                 }
             }
 
-            // changed: older cards reviewed/edited after the last sync
+            // changed: pre-existing cards edited/reviewed locally, not yet uploaded
             let mut changed: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-            if last_ms > 0 {
+            {
                 let mut stmt = db.prepare(
-                    "select did, count(*) from cards where mod > ? and id <= ? group by did",
+                    "select did, count(*) from cards where usn = -1 and id <= ? group by did",
                 )?;
-                let rows = stmt.query_map(params![last_sec, last_ms], |row| {
+                let rows = stmt.query_map(params![last_ms], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 })?;
                 for r in rows {
@@ -917,7 +924,7 @@ impl KelmaSession {
             // only — the plugin deliberately does not roll children into parents
             // so each row's badge reflects just that deck).
             let mut decks: Vec<Value> = Vec::new();
-            let mut dids: std::collections::BTreeSet<i64> = added.keys().chain(changed.keys()).copied().collect();
+            let dids: std::collections::BTreeSet<i64> = added.keys().chain(changed.keys()).copied().collect();
             for did in dids {
                 let a = added.get(&did).copied().unwrap_or(0);
                 let c = changed.get(&did).copied().unwrap_or(0);
