@@ -8,7 +8,7 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -263,6 +263,7 @@ function StatsBody({ stats }: { stats: DeckStats }) {
         <CardCountsSection counts={stats.cardCounts.excludingInactive} />
       )}
       {stats.reviews && <ReviewsSection reviews={stats.reviews} />}
+      {stats.reviews && <CorrelationsSection reviews={stats.reviews} />}
       {stats.buttons && <ButtonsSection buttons={stats.buttons} days={stats.days} />}
       {stats.intervals && (
         <HistogramCard
@@ -477,6 +478,224 @@ function dayLabel(k: number): string {
   if (k === 0) return 'today';
   if (k % 30 === 0) return String(k);
   return '';
+}
+
+// --- Correlations scatter -------------------------------------------------
+// A self-contained scatter of one per-day metric against another. Each of the
+// X and Y axes toggles between Date, Review time, and Review total; the plot,
+// regression line, and Pearson correlation coefficient recompute on change.
+// Drawn with plain RN views (no chart dependency): dots are absolutely
+// positioned, the trend line is a single rotated view.
+type AxisKey = 'date' | 'time' | 'total';
+type DayPoint = { d: number; t: number; n: number };
+
+const AXIS_META: Record<AxisKey, { label: string; short: string; get: (p: DayPoint) => number }> = {
+  date: { label: 'Date', short: 'Date', get: p => p.d },
+  time: { label: 'Review time (min)', short: 'Time', get: p => p.t },
+  total: { label: 'Reviews', short: 'Total', get: p => p.n },
+};
+
+function pearson(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  if (n < 2) return NaN;
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i];
+    sy += ys[i];
+    sxx += xs[i] * xs[i];
+    syy += ys[i] * ys[i];
+    sxy += xs[i] * ys[i];
+  }
+  const cov = sxy - (sx * sy) / n;
+  const vx = sxx - (sx * sx) / n;
+  const vy = syy - (sy * sy) / n;
+  if (vx <= 0 || vy <= 0) return NaN;
+  return cov / Math.sqrt(vx * vy);
+}
+
+function axisTick(axis: AxisKey, v: number): string {
+  if (axis === 'date') {
+    const d = new Date();
+    d.setDate(d.getDate() + Math.round(v));
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  }
+  return `${Math.round(v)}`;
+}
+
+function CorrelationsSection({ reviews }: { reviews: NonNullable<DeckStats['reviews']> }) {
+  const [xKey, setXKey] = useState<AxisKey>('date');
+  const [yKey, setYKey] = useState<AxisKey>('time');
+  const [width, setWidth] = useState(0);
+
+  const points = useMemo<DayPoint[]>(() => {
+    const sum = (r?: ReviewsByType) =>
+      r ? r.learn + r.relearn + r.young + r.mature + r.filtered : 0;
+    const keys = new Set([...Object.keys(reviews.count), ...Object.keys(reviews.time)]);
+    return [...keys]
+      .map(k => ({ d: Number(k), n: sum(reviews.count[k]), t: sum(reviews.time[k]) / 60000 }))
+      .filter(p => p.n > 0 || p.t > 0)
+      .sort((a, b) => a.d - b.d);
+  }, [reviews]);
+
+  const H = 240;
+  const PADL = 46;
+  const PADR = 14;
+  const PADT = 12;
+  const PADB = 30;
+  const W = width;
+  const ax = AXIS_META[xKey];
+  const ay = AXIS_META[yKey];
+  const xs = points.map(ax.get);
+  const ys = points.map(ay.get);
+  const r = pearson(xs, ys);
+
+  const renderToggle = (value: AxisKey, set: (k: AxisKey) => void) => (
+    <View style={styles.axisRow}>
+      {(Object.keys(AXIS_META) as AxisKey[]).map(k => (
+        <Pressable
+          key={k}
+          onPress={() => set(k)}
+          style={[styles.axisPill, value === k && styles.periodActive]}>
+          <Text style={[styles.periodText, value === k && styles.periodTextActive]}>
+            {AXIS_META[k].short}
+          </Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+
+  const renderPlot = () => {
+    if (points.length < 2 || W <= 0) {
+      return <Text style={styles.emptyChart}>Not enough review data yet.</Text>;
+    }
+    let xmin = Math.min(...xs);
+    let xmax = Math.max(...xs);
+    let ymin = Math.min(...ys);
+    let ymax = Math.max(...ys);
+    if (xmax === xmin) xmax = xmin + 1;
+    if (ymax === ymin) ymax = ymin + 1;
+    const sx = (v: number) => PADL + ((v - xmin) / (xmax - xmin)) * (W - PADL - PADR);
+    const sy = (v: number) => H - PADB - ((v - ymin) / (ymax - ymin)) * (H - PADT - PADB);
+
+    // least-squares regression line
+    let line: ReactNode = null;
+    const n = xs.length;
+    const mx = xs.reduce((a, b) => a + b, 0) / n;
+    const my = ys.reduce((a, b) => a + b, 0) / n;
+    let num = 0;
+    let den = 0;
+    for (let i = 0; i < n; i++) {
+      num += (xs[i] - mx) * (ys[i] - my);
+      den += (xs[i] - mx) * (xs[i] - mx);
+    }
+    if (den > 0) {
+      const slope = num / den;
+      const b0 = my - slope * mx;
+      const p1x = sx(xmin);
+      const p1y = sy(b0 + slope * xmin);
+      const p2x = sx(xmax);
+      const p2y = sy(b0 + slope * xmax);
+      const len = Math.hypot(p2x - p1x, p2y - p1y);
+      const angle = Math.atan2(p2y - p1y, p2x - p1x);
+      line = (
+        <View
+          style={{
+            position: 'absolute',
+            left: (p1x + p2x) / 2 - len / 2,
+            top: (p1y + p2y) / 2 - 1,
+            width: len,
+            height: 2,
+            backgroundColor: palette.gold,
+            opacity: 0.9,
+            transform: [{ rotateZ: `${angle}rad` }],
+          }}
+        />
+      );
+    }
+
+    return (
+      <View style={{ height: H, width: '100%' }}>
+        {[0, 1, 2, 3, 4].map(i => {
+          const f = i / 4;
+          const gx = xmin + f * (xmax - xmin);
+          const gy = ymin + f * (ymax - ymin);
+          return (
+            <View key={i} pointerEvents="none">
+              <View
+                style={{
+                  position: 'absolute',
+                  left: sx(gx),
+                  top: PADT,
+                  width: StyleSheet.hairlineWidth,
+                  height: H - PADT - PADB,
+                  backgroundColor: palette.surfaceBorder,
+                }}
+              />
+              <View
+                style={{
+                  position: 'absolute',
+                  left: PADL,
+                  top: sy(gy),
+                  width: W - PADL - PADR,
+                  height: StyleSheet.hairlineWidth,
+                  backgroundColor: palette.surfaceBorder,
+                }}
+              />
+              <Text
+                style={[
+                  styles.scatterTick,
+                  { position: 'absolute', top: H - PADB + 5, left: sx(gx) - 20, width: 40, textAlign: 'center' },
+                ]}>
+                {axisTick(xKey, gx)}
+              </Text>
+              <Text
+                style={[
+                  styles.scatterTick,
+                  { position: 'absolute', top: sy(gy) - 6, left: 0, width: PADL - 6, textAlign: 'right' },
+                ]}>
+                {axisTick(yKey, gy)}
+              </Text>
+            </View>
+          );
+        })}
+        {line}
+        {points.map((p, i) => (
+          <View
+            key={i}
+            style={{
+              position: 'absolute',
+              left: sx(ax.get(p)) - 3.5,
+              top: sy(ay.get(p)) - 3.5,
+              width: 7,
+              height: 7,
+              borderRadius: 3.5,
+              backgroundColor: palette.goldSoft,
+              opacity: 0.85,
+            }}
+          />
+        ))}
+      </View>
+    );
+  };
+
+  return (
+    <Card title="Correlations" hint={`${ay.label} vs ${ax.label}`}>
+      <Text style={styles.axisCaption}>X axis</Text>
+      {renderToggle(xKey, setXKey)}
+      <Text style={styles.axisCaption}>Y axis</Text>
+      {renderToggle(yKey, setYKey)}
+      <View onLayout={e => setWidth(e.nativeEvent.layout.width)} style={{ marginTop: 10 }}>
+        {renderPlot()}
+      </View>
+      <Text style={styles.scatterR}>
+        Pearson r ={' '}
+        <Text style={{ color: palette.gold, fontWeight: '800' }}>
+          {Number.isNaN(r) ? '—' : r.toFixed(3)}
+        </Text>
+        {`  (n=${points.length} days)`}
+      </Text>
+    </Card>
+  );
 }
 
 function pickByDays<T>(
@@ -774,4 +993,24 @@ const styles = StyleSheet.create({
   xAxis: { flexDirection: 'row', gap: 2, marginTop: 4 },
   xLabel: { color: palette.textMuted, fontSize: 9 },
   emptyChart: { color: palette.textMuted, fontSize: 13, paddingVertical: 16 },
+  // Correlations scatter
+  axisRow: { flexDirection: 'row', gap: 6 },
+  axisPill: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 6,
+    borderRadius: radius.sm,
+    backgroundColor: palette.surface,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+  },
+  axisCaption: {
+    color: palette.textMuted,
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  scatterTick: { color: palette.textMuted, fontSize: 9 },
+  scatterR: { color: palette.textPrimary, fontSize: 14, textAlign: 'center', marginTop: 12 },
 });
