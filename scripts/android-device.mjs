@@ -26,9 +26,9 @@ function run(cmd, args, options = {}) {
   const result = spawnSync(cmd, args, {
     cwd: root,
     stdio: 'inherit',
-    env: { ...process.env, ...(options.env || {}) },
     shell: process.platform === 'win32',
     ...options,
+    env: { ...process.env, ...(options.env || {}) },
   })
 
   if (result.error) {
