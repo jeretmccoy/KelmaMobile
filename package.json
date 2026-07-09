@@ -5,6 +5,12 @@
   "private": true,
   "scripts": {
     "android": "react-native run-android",
+    "android:device": "node scripts/android-device.mjs run",
+    "android:doctor": "node scripts/android-device.mjs doctor",
+    "android:apk:debug": "node scripts/android-device.mjs apk:debug",
+    "android:apk:release": "node scripts/android-device.mjs apk:release",
+    "android:install:debug": "node scripts/android-device.mjs install:debug",
+    "android:install:release": "node scripts/android-device.mjs install:release",
     "codegen:android": "react-native codegen --platform android",
     "ios": "react-native run-ios",
     "lint": "eslint .",

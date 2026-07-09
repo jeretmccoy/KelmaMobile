@@ -58,6 +58,37 @@ npm run lint
 npm run android
 ```
 
+### Quick Android device testing
+
+1. On the Android phone, enable Developer Options by tapping **Build number** 7 times.
+2. Enable **USB debugging**.
+3. Plug the phone into the computer and accept the USB debugging/RSA prompt.
+4. Run:
+
+```sh
+npm run android:doctor
+npm run android:device
+```
+
+`android:device` starts Metro if needed, finds the first connected phone, forwards Metro (`tcp:8081`), builds, installs, and launches KelmaMobile. If multiple devices are connected, choose one with:
+
+```sh
+# macOS/Linux/Git Bash
+ANDROID_SERIAL=<adb-device-id> npm run android:device
+
+# Windows PowerShell
+$env:ANDROID_SERIAL='<adb-device-id>'; npm run android:device
+```
+
+Useful APK commands:
+
+```sh
+npm run android:apk:debug       # build debug APK only
+npm run android:install:debug   # build/install/launch debug APK
+npm run android:apk:release     # build release APK only, currently debug-signed
+npm run android:install:release # build/install/launch standalone release APK
+```
+
 For iOS:
 
 ```sh
