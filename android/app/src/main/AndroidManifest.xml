@@ -11,6 +11,15 @@
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="${usesCleartextTraffic}"
       android:supportsRtl="true">
+      <provider
+        android:name="androidx.core.content.FileProvider"
+        android:authorities="${applicationId}.fileprovider"
+        android:exported="false"
+        android:grantUriPermissions="true">
+        <meta-data
+          android:name="android.support.FILE_PROVIDER_PATHS"
+          android:resource="@xml/file_paths" />
+      </provider>
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"
@@ -21,6 +30,19 @@
         <intent-filter>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+        <intent-filter>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="content" />
+            <data android:scheme="file" />
+            <data android:host="*" />
+            <data android:pathPattern=".*\\.apkg" />
+            <data android:pathPattern=".*\\..*\\.apkg" />
+            <data android:pathPattern=".*\\..*\\..*\\.apkg" />
+            <data android:mimeType="application/apkg" />
+            <data android:mimeType="application/octet-stream" />
         </intent-filter>
       </activity>
     </application>

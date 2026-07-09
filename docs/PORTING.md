@@ -16,7 +16,7 @@ is newer than the packaged core and must not be linked into only one platform.
 |---|---|---|---|
 | Foundation | `CollectionManager`, `libanki`, `rsdroid` | Typed TurboModule and shared core lifecycle | Android and iOS working |
 | Collection + decks | `DeckPicker`, `CollectionManager` | Open/create collection, deck tree and counts | Next |
-| Deck inspector | `StudyOptionsFragment`, `CardBrowser` (deck-scoped) | Per-deck overview + paged card browser | Done |
+| Deck inspector | `StudyOptionsFragment`, `CardBrowser` (deck-scoped) | Per-deck overview + paged card browser; card detail with browser-style actions (suspend / bury / mark / flag / change deck / delete) | Done |
 | Reviewer | `reviewer/`, `AbstractFlashcardViewer` | Shared reviewer shell, WebView card, answer actions | Pending |
 | Editor | `NoteEditor`, multimedia fields | Shared note editor with platform media pickers | Pending |
 | Sync | sync screens + backend sync calls | rslib sync against KelmaSync with progress UI; persisted credentials + home Sync button; per-deck pending badges | Done (incremental) |

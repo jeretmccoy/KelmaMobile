@@ -1,0 +1,32 @@
+{
+  "name": "Kelma",
+  "identifier": "tech.kelma.altstore",
+  "sourceURL": "https://kelma.tech/altstore/source.json",
+  "apps": [
+    {
+      "name": "KelmaMobile",
+      "bundleIdentifier": "tech.kelma.mobile.dev",
+      "developerName": "Kelma",
+      "subtitle": "Kelma mobile app",
+      "localizedDescription": "Kelma mobile app preview build for AltStore sideloading.",
+      "iconURL": "https://kelma.tech/altstore/icon.png",
+      "tintColor": "0D9488",
+      "category": "education",
+      "version": "1.0",
+      "versionDate": "2026-07-09",
+      "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+      "size": 13703061,
+      "sha256": "9918a4e69be9c858d1e0680590b2baf8c31f2375118df118ec3ce34cb0830b11",
+      "versions": [
+        {
+          "version": "1.0",
+          "date": "2026-07-09",
+          "localizedDescription": "Initial AltStore preview build.",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "size": 13703061,
+          "sha256": "9918a4e69be9c858d1e0680590b2baf8c31f2375118df118ec3ce34cb0830b11"
+        }
+      ]
+    }
+  ]
+}

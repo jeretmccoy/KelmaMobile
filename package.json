@@ -28,7 +28,8 @@
     },
     "ios": {
       "modulesProvider": {
-        "NativeKelmaCore": "RCTNativeKelmaCore"
+        "NativeKelmaCore": "RCTNativeKelmaCore",
+        "NativeKelmaShare": "RCTNativeKelmaShare"
       }
     }
   },

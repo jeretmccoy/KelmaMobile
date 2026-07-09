@@ -3,6 +3,9 @@
  * HTML + CSS, so cloze/blur/images/fonts all work) in a WebView, the way the
  * reviewer shows it — but read-only, with a reveal toggle and native audio.
  *
+ * Browser-style card options (suspend / bury / mark / flag / change deck /
+ * delete) live in the shared `CardOptionsSheet`.
+ *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
@@ -16,13 +19,18 @@ import {
 } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 import { audioPlayer } from '../audio/AudioPlayer';
-import { getCardDetail, getMediaDir, type CardDetail } from '../core/KelmaCore';
-import { answerBack, buildCardHtml, extractSoundTags, palette } from './theme';
+import { getCardDetail, getMediaDir, writeCardHtml, type CardDetail } from '../core/KelmaCore';
+import { CardOptionsSheet } from './CardOptionsSheet';
+import { answerBack, buildCardHtml, extractSoundTags, palette, radius, shadow, spacing } from './theme';
 
 type Props = {
   cardId: number;
   deckName: string;
   onBack: () => void;
+  /** Open the note editor for a card (the sheet closes itself first). */
+  onEditCard?: (cardId: number) => void;
+  /** Called after any mutating action so callers can refresh the browser/list. */
+  onChanged?: () => void;
 };
 
 type State =
@@ -30,10 +38,11 @@ type State =
   | { kind: 'error'; message: string }
   | { kind: 'card'; data: CardDetail };
 
-export function CardDetailScreen({ cardId, deckName, onBack }: Props) {
+export function CardDetailScreen({ cardId, deckName, onBack, onEditCard, onChanged }: Props) {
   const [state, setState] = useState<State>({ kind: 'loading' });
   const [revealed, setRevealed] = useState(false);
   const [mediaDir, setMediaDir] = useState<string | null>(null);
+  const [optionsOpen, setOptionsOpen] = useState(false);
   const mediaDirRequest = useRef<Promise<string> | null>(null);
 
   const resolveMediaDir = useCallback(() => {
@@ -90,7 +99,13 @@ export function CardDetailScreen({ cardId, deckName, onBack }: Props) {
         <Text style={styles.deckTitle} numberOfLines={1}>
           {deckName}
         </Text>
-        <View style={styles.topBarSpacer} />
+        <Pressable
+          onPress={() => setOptionsOpen(true)}
+          accessibilityRole="button"
+          hitSlop={12}
+          disabled={state.kind !== 'card'}>
+          <Text style={styles.menuButton}>⋯</Text>
+        </Pressable>
       </View>
 
       {state.kind === 'loading' && (
@@ -128,6 +143,21 @@ export function CardDetailScreen({ cardId, deckName, onBack }: Props) {
           )}
         </>
       )}
+
+      <CardOptionsSheet
+        cardId={cardId}
+        visible={optionsOpen}
+        onClose={() => setOptionsOpen(false)}
+        onCardRemoved={() => {
+          onChanged?.();
+          onBack(); // deleted/suspended/buried: nothing to show here
+        }}
+        onCardUpdated={() => {
+          onChanged?.();
+          load(); // refresh this screen's own state (flag/mark/deck)
+        }}
+        onEdit={onEditCard}
+      />
     </View>
   );
 }
@@ -143,15 +173,37 @@ function CardSideView({
   mediaDir: string | null;
   onPlay: (sound: string) => void;
 }) {
+  // The rendered `answer` is the full Answer Template output — normally
+  // `{{FrontSide}}<hr id=answer>{{Back}}` — exactly what desktop Anki shows on
+  // reveal. Templates often rely on that FrontSide portion (e.g. repeating the
+  // front's text or image above the translation), so it must not be stripped.
   const sideHtml = useMemo(
-    () => (revealed ? answerBack(card.answer) : card.question),
+    () => (revealed ? card.answer : card.question),
     [revealed, card.question, card.answer],
   );
 
   const html = useMemo(
-    () => buildCardHtml(sideHtml, card.css ?? '', false),
-    [sideHtml, card.css],
+    () => buildCardHtml(sideHtml, card.css ?? '', false, mediaDir),
+    [sideHtml, card.css, mediaDir],
   );
+
+  // Loaded via `source.uri` (a scratch file), not `source.html` — WKWebView
+  // never grants the latter's sandboxed renderer read access to local
+  // `file://` images (see `writeCardHtml` in KelmaCore.ts).
+  const [source, setSource] = useState<{ uri: string; allowedRoot: string } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    writeCardHtml(html)
+      .then(file => {
+        if (!cancelled) {
+          setSource({ uri: file.uri, allowedRoot: file.allowedRoot });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [html]);
 
   const onMessage = (event: WebViewMessageEvent) => {
     try {
@@ -164,22 +216,30 @@ function CardSideView({
     }
   };
 
-  const baseUrl = mediaDir ? `file://${mediaDir}/` : undefined;
+  if (!source) {
+    return (
+      <View style={styles.cardShell}>
+        <View style={styles.web} />
+      </View>
+    );
+  }
 
   return (
-    <WebView
-      style={styles.web}
-      originWhitelist={['*']}
-      source={baseUrl ? { html, baseUrl } : { html }}
-      onMessage={onMessage}
-      allowFileAccess
-      allowsInlineMediaPlayback
-      allowingReadAccessToURL={baseUrl}
-      scrollEnabled
-      showsVerticalScrollIndicator
-      automaticallyAdjustContentInsets={false}
-      contentInsetAdjustmentBehavior="never"
-    />
+    <View style={styles.cardShell}>
+      <WebView
+        style={styles.web}
+        originWhitelist={['*']}
+        source={{ uri: source.uri }}
+        allowingReadAccessToURL={source.allowedRoot}
+        onMessage={onMessage}
+        allowFileAccess
+        allowsInlineMediaPlayback
+        scrollEnabled
+        showsVerticalScrollIndicator
+        automaticallyAdjustContentInsets={false}
+        contentInsetAdjustmentBehavior="never"
+      />
+    </View>
   );
 }
 
@@ -190,7 +250,7 @@ function playFirst(sounds: string[], play: (s: string) => void) {
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, paddingHorizontal: 20, paddingBottom: 16 },
+  screen: { flex: 1, backgroundColor: palette.background, paddingHorizontal: spacing.lg, paddingBottom: spacing.lg },
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -206,32 +266,38 @@ const styles = StyleSheet.create({
     marginHorizontal: 12,
     textAlign: 'center',
   },
-  topBarSpacer: { width: 48 },
+  menuButton: { color: palette.goldSoft, fontSize: 26, fontWeight: '700', lineHeight: 28 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
+  cardShell: {
+    flex: 1,
+    marginTop: spacing.xs,
+    marginBottom: spacing.md,
+    // Full width, edge-to-edge: no border, radius, or shadow.
+    marginHorizontal: -spacing.lg,
+    backgroundColor: palette.surface,
+  },
   web: {
     flex: 1,
-    marginTop: 12,
-    marginHorizontal: -20,
-    backgroundColor: palette.background,
+    backgroundColor: palette.surface,
   },
   flipButton: {
     backgroundColor: palette.surface,
     borderColor: palette.surfaceBorder,
     borderWidth: 1,
-    borderRadius: 14,
+    borderRadius: radius.lg,
     paddingVertical: 16,
     alignItems: 'center',
+    ...shadow.subtle,
   },
-  flipText: { color: palette.goldSoft, fontSize: 16, fontWeight: '700' },
+  flipText: { color: palette.goldSoft, fontSize: 16, fontWeight: '800' },
   errorTitle: { color: palette.bad, fontSize: 18, fontWeight: '700' },
   errorBody: { color: palette.textSecondary, fontSize: 14, textAlign: 'center', paddingHorizontal: 20 },
   retry: {
-    borderColor: palette.surfaceBorder,
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    backgroundColor: palette.gold,
+    borderRadius: radius.md,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
     marginTop: 8,
   },
-  retryText: { color: palette.goldSoft, fontSize: 14, fontWeight: '700' },
+  retryText: { color: palette.background, fontSize: 15, fontWeight: '800' },
 });

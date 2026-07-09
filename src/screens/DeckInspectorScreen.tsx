@@ -11,10 +11,12 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Modal,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -22,17 +24,22 @@ import {
 import {
   browseDeck,
   CardColor,
+  exportDeck,
   getDeckOverview,
   type BrowseCard,
   type DeckOverview,
+  type ExportResult,
 } from '../core/KelmaCore';
-import { palette } from './theme';
+import { shareFile } from '../core/Share';
+import { headerStyles, palette, radius, shadow, spacing } from './theme';
 
 type Props = {
   deckId: number;
   deckName: string;
   onStudy: () => void;
   onOpenCard: (cardId: number) => void;
+  /** Open the Add note screen for this deck (AnkiDroid's Add). */
+  onAdd: () => void;
   onBack: () => void;
   /** Bump to refresh after a sync or review session. */
   reloadToken: number;
@@ -69,6 +76,7 @@ export function DeckInspectorScreen({
   deckName,
   onStudy,
   onOpenCard,
+  onAdd,
   onBack,
   reloadToken,
 }: Props) {
@@ -83,6 +91,7 @@ export function DeckInspectorScreen({
   const [loadingCards, setLoadingCards] = useState(false);
   const [cardsError, setCardsError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
 
   const loadOverview = useCallback(() => {
     setOverviewError(null);
@@ -151,12 +160,13 @@ export function DeckInspectorScreen({
             accessibilityLabel="Back to decks">
             <Text style={styles.back}>‹ Decks</Text>
           </Pressable>
-          <Text style={styles.eyebrow}>DECK</Text>
-          <View style={styles.headerSpacer} />
         </View>
-        <Text style={styles.deckName} numberOfLines={2}>
-          {deckName}
-        </Text>
+        <View style={[headerStyles.titleRow, styles.deckNameRow]}>
+          <View style={headerStyles.accentTall} />
+          <Text style={styles.deckName} numberOfLines={2}>
+            {deckName}
+          </Text>
+        </View>
 
         <View style={styles.tabBar}>
           <Pressable
@@ -184,7 +194,13 @@ export function DeckInspectorScreen({
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={palette.gold} />
           }>
-          <OverviewTab overview={overview} error={overviewError} onStudy={onStudy} />
+          <OverviewTab
+            overview={overview}
+            error={overviewError}
+            onStudy={onStudy}
+            onAdd={onAdd}
+            onExport={() => setExportOpen(true)}
+          />
         </ScrollView>
       ) : (
         <View style={styles.scrollArea}>
@@ -240,6 +256,12 @@ export function DeckInspectorScreen({
           )}
         </View>
       )}
+      <ExportSheet
+        visible={exportOpen}
+        deckId={deckId}
+        deckName={deckName}
+        onClose={() => setExportOpen(false)}
+      />
     </View>
   );
 }
@@ -248,10 +270,14 @@ function OverviewTab({
   overview,
   error,
   onStudy,
+  onAdd,
+  onExport,
 }: {
   overview: DeckOverview | null;
   error: string | null;
   onStudy: () => void;
+  onAdd: () => void;
+  onExport: () => void;
 }) {
   const dueToday = overview
     ? overview.todayNew + overview.todayLearn + overview.todayReview
@@ -273,7 +299,7 @@ function OverviewTab({
       <View style={styles.cardBox}>
         <Text style={styles.sectionLabel}>Due today</Text>
         <View style={styles.countRow}>
-          <Count label="New" value={overview.todayNew} color="#6f9fb0" />
+          <Count label="New" value={overview.todayNew} color={palette.newCard} />
           <Count label="Learning" value={overview.todayLearn} color={palette.bad} />
           <Count label="Review" value={overview.todayReview} color={palette.good} />
         </View>
@@ -309,6 +335,25 @@ function OverviewTab({
           {dueToday === 0 ? 'Study (nothing due)' : 'Study now'}
         </Text>
       </Pressable>
+
+      <View style={styles.actionRow}>
+        <Pressable
+          onPress={onAdd}
+          style={({ pressed }) => [
+            styles.secondaryButton,
+            pressed && styles.secondaryButtonPressed,
+          ]}>
+          <Text style={styles.secondaryButtonText}>+ Add card</Text>
+        </Pressable>
+        <Pressable
+          onPress={onExport}
+          style={({ pressed }) => [
+            styles.secondaryButton,
+            pressed && styles.secondaryButtonPressed,
+          ]}>
+          <Text style={styles.secondaryButtonText}>Export</Text>
+        </Pressable>
+      </View>
     </>
   );
 }
@@ -366,32 +411,27 @@ const styles = StyleSheet.create({
   searchBar: { paddingHorizontal: 24, paddingBottom: 8 },
   listArea: { flex: 1 },
   listContent: { paddingHorizontal: 24, paddingBottom: 40 },
-  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 6 },
+  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
   back: { color: palette.goldSoft, fontSize: 15, fontWeight: '700' },
-  eyebrow: {
-    color: palette.gold,
-    fontSize: 12,
-    fontWeight: '800',
-    letterSpacing: 3.2,
-    marginLeft: 'auto',
-  },
-  headerSpacer: { width: 60 },
+  deckNameRow: { marginBottom: 18, alignItems: 'flex-start' },
   deckName: {
+    flex: 1,
     color: palette.textPrimary,
-    fontSize: 28,
-    fontWeight: '700',
-    letterSpacing: -0.5,
-    marginBottom: 18,
+    fontSize: 30,
+    fontWeight: '800',
+    letterSpacing: -0.8,
   },
   tabBar: {
     flexDirection: 'row',
     backgroundColor: palette.surface,
-    borderRadius: 12,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: radius.md,
     padding: 4,
     marginBottom: 18,
   },
-  tab: { flex: 1, paddingVertical: 9, borderRadius: 9, alignItems: 'center' },
-  tabActive: { backgroundColor: palette.background },
+  tab: { flex: 1, paddingVertical: 9, borderRadius: radius.sm, alignItems: 'center' },
+  tabActive: { backgroundColor: palette.surfaceHigh, ...shadow.subtle },
   tabText: { color: palette.textSecondary, fontSize: 14, fontWeight: '700' },
   tabTextActive: { color: palette.textPrimary },
   center: { paddingVertical: 24, alignItems: 'center' },
@@ -399,24 +439,18 @@ const styles = StyleSheet.create({
   empty: { color: palette.textSecondary, fontSize: 15, lineHeight: 22, paddingVertical: 16 },
 
   cardBox: {
-    backgroundColor: palette.surface,
-    borderColor: palette.surfaceBorder,
-    borderWidth: 1,
-    borderRadius: 14,
-    padding: 16,
-    marginBottom: 16,
+    marginBottom: spacing.xl,
   },
   sectionLabel: {
-    color: palette.textMuted,
-    fontSize: 12,
+    color: palette.textSecondary,
+    fontSize: 13,
     fontWeight: '800',
-    letterSpacing: 1.5,
+    letterSpacing: 0.2,
     marginBottom: 12,
-    textTransform: 'uppercase',
   },
   countRow: { flexDirection: 'row', marginBottom: 14 },
   countCell: { flex: 1, alignItems: 'center' },
-  countValue: { fontSize: 26, fontWeight: '800' },
+  countValue: { fontSize: 28, fontWeight: '800' },
   countLabel: { color: palette.textSecondary, fontSize: 12, fontWeight: '700', marginTop: 3 },
   totalRow: {
     flexDirection: 'row',
@@ -435,10 +469,11 @@ const styles = StyleSheet.create({
 
   studyButton: {
     backgroundColor: palette.gold,
-    borderRadius: 14,
-    paddingVertical: 15,
+    borderRadius: radius.lg,
+    paddingVertical: 16,
     alignItems: 'center',
     marginTop: 4,
+    ...shadow.card,
   },
   studyButtonPressed: { opacity: 0.85 },
   studyButtonText: {
@@ -447,6 +482,133 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 0.3,
   },
+  actionRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 12,
+  },
+  secondaryButton: {
+    flex: 1,
+    backgroundColor: palette.surface,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: radius.lg,
+    paddingVertical: 14,
+    alignItems: 'center',
+    ...shadow.subtle,
+  },
+  secondaryButtonPressed: { opacity: 0.7 },
+  secondaryButtonText: {
+    color: palette.goldSoft,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+
+  // --- Export sheet ---
+  overlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'flex-end',
+  },
+  sheet: {
+    backgroundColor: palette.surface,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    padding: 20,
+    paddingBottom: 36,
+    maxHeight: '85%',
+  },
+  sheetHandle: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: palette.surfaceBorder,
+    alignSelf: 'center',
+    marginBottom: 14,
+  },
+  sheetTitle: {
+    color: palette.textPrimary,
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  sheetSubtitle: {
+    color: palette.textSecondary,
+    fontSize: 14,
+    marginBottom: 16,
+  },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    borderTopColor: palette.surfaceBorder,
+    borderTopWidth: 1,
+  },
+  optionText: { flex: 1, paddingRight: 12 },
+  optionLabel: {
+    color: palette.textPrimary,
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  optionHint: {
+    color: palette.textMuted,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  exportButton: {
+    backgroundColor: palette.gold,
+    borderRadius: 14,
+    paddingVertical: 15,
+    alignItems: 'center',
+    marginTop: 18,
+  },
+  exportButtonText: {
+    color: palette.background,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  exportResult: {
+    color: palette.good,
+    fontSize: 14,
+    marginTop: 14,
+    lineHeight: 20,
+  },
+  exportError: {
+    color: palette.bad,
+    fontSize: 14,
+    marginTop: 14,
+    lineHeight: 20,
+  },
+  exportPath: {
+    color: palette.textMuted,
+    fontSize: 12,
+    marginTop: 8,
+  },
+  shareRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 12,
+  },
+  shareButton: {
+    flex: 1,
+    backgroundColor: palette.surface,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingVertical: 13,
+    alignItems: 'center',
+  },
+  shareButtonText: { color: palette.goldSoft, fontSize: 15, fontWeight: '700' },
+  doneButton: {
+    flex: 1,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingVertical: 13,
+    alignItems: 'center',
+  },
+  doneButtonText: { color: palette.textSecondary, fontSize: 15, fontWeight: '700' },
 
   searchBox: {
     flexDirection: 'row',
@@ -465,17 +627,188 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   cardRow: {
-    backgroundColor: palette.surface,
-    borderColor: palette.surfaceBorder,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 10,
+    paddingVertical: spacing.lg,
+    borderBottomColor: palette.hairline,
+    borderBottomWidth: 1,
   },
-  cardRowPressed: { backgroundColor: palette.surfaceBorder },
+  cardRowPressed: { backgroundColor: palette.surface },
   cardQuestion: { color: palette.textPrimary, fontSize: 15, lineHeight: 21 },
   cardMetaRow: { flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 10 },
   badge: { fontSize: 11, fontWeight: '800', letterSpacing: 0.4 },
   cardMeta: { color: palette.textMuted, fontSize: 12, flex: 1 },
   chevron: { color: palette.textMuted, fontSize: 18, fontWeight: '700' },
 });
+
+/** Export sheet: package this deck (and subdecks) into an `.apkg` file, with
+ *  AnkiDroid-style toggles for scheduling / media / deck configs, then offer a
+ *  share button for the generated file. */
+function ExportSheet({
+  visible,
+  deckId,
+  deckName,
+  onClose,
+}: {
+  visible: boolean;
+  deckId: number;
+  deckName: string;
+  onClose: () => void;
+}) {
+  const [withScheduling, setWithScheduling] = useState(true);
+  const [withMedia, setWithMedia] = useState(true);
+  const [withDeckConfigs, setWithDeckConfigs] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ExportResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => {
+    setResult(null);
+    setError(null);
+  };
+
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const out = await exportDeck(deckId, deckName, {
+        withScheduling,
+        withMedia,
+        withDeckConfigs,
+      });
+      setResult(out);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Export failed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const share = async () => {
+    if (!result) {
+      return;
+    }
+    try {
+      await shareFile(result.path, deckName);
+    } catch {
+      // The native share sheet rejected or was dismissed; no action needed.
+    }
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}>
+      <Pressable style={styles.overlay} onPress={onClose}>
+        <Pressable style={styles.sheet} onPress={e => e.stopPropagation()}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Export deck</Text>
+          <Text style={styles.sheetSubtitle} numberOfLines={1}>
+            {deckName} · .apkg package
+          </Text>
+
+          <OptionRow
+            label="Include scheduling"
+            hint="Review intervals and due dates"
+            value={withScheduling}
+            onValueChange={setWithScheduling}
+          />
+          <OptionRow
+            label="Include media"
+            hint="Images and audio files"
+            value={withMedia}
+            onValueChange={setWithMedia}
+          />
+          <OptionRow
+            label="Include deck configs"
+            hint="New/rev limits and options"
+            value={withDeckConfigs}
+            onValueChange={setWithDeckConfigs}
+          />
+
+          {result ? (
+            <>
+              <Text style={styles.exportResult}>
+                Exported {result.notes.toLocaleString()}{' '}
+                {result.notes === 1 ? 'note' : 'notes'}.
+              </Text>
+              <Text style={styles.exportPath} numberOfLines={2}>
+                {result.path}
+              </Text>
+              <View style={styles.shareRow}>
+                <Pressable
+                  onPress={share}
+                  disabled={busy}
+                  style={({ pressed }) => [
+                    styles.shareButton,
+                    pressed && styles.secondaryButtonPressed,
+                  ]}>
+                  <Text style={styles.shareButtonText}>Share…</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    reset();
+                    onClose();
+                  }}
+                  disabled={busy}
+                  style={({ pressed }) => [
+                    styles.doneButton,
+                    pressed && styles.secondaryButtonPressed,
+                  ]}>
+                  <Text style={styles.doneButtonText}>Done</Text>
+                </Pressable>
+              </View>
+            </>
+          ) : (
+            <>
+              {error ? (
+                <Text style={styles.exportError}>{error}</Text>
+              ) : null}
+              <Pressable
+                onPress={run}
+                disabled={busy}
+                style={({ pressed }) => [
+                  styles.exportButton,
+                  pressed && styles.studyButtonPressed,
+                  busy && { opacity: 0.6 },
+                ]}>
+                {busy ? (
+                  <ActivityIndicator color={palette.background} />
+                ) : (
+                  <Text style={styles.exportButtonText}>Export</Text>
+                )}
+              </Pressable>
+            </>
+          )}
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
+function OptionRow({
+  label,
+  hint,
+  value,
+  onValueChange,
+}: {
+  label: string;
+  hint: string;
+  value: boolean;
+  onValueChange: (value: boolean) => void;
+}) {
+  return (
+    <View style={styles.optionRow}>
+      <View style={styles.optionText}>
+        <Text style={styles.optionLabel}>{label}</Text>
+        <Text style={styles.optionHint}>{hint}</Text>
+      </View>
+      <Switch
+        value={value}
+        onValueChange={onValueChange}
+        trackColor={{ false: palette.surfaceBorder, true: palette.gold }}
+        thumbColor={value ? palette.background : palette.textMuted}
+      />
+    </View>
+  );
+}

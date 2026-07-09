@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  FileProvider path configuration for sharing exported files (.apkg) with other
+  apps. `cache-path` covers the app cache dir where `exportDeck` writes on
+  Android; `files-path` and `external-cache-path` are included so future
+  exports/imports from other app dirs keep working without a manifest change.
+-->
+<paths>
+    <cache-path name="cache" path="." />
+    <cache-path name="exports" path="exports/" />
+    <files-path name="files" path="." />
+    <external-cache-path name="external-cache" path="." />
+</paths>

@@ -52,7 +52,7 @@ static NSString *KelmaStringFromBuffer(KelmaBuffer buffer)
 // directory if needed, and returns the JSON request expected by the Rust core.
 // The collection lives under Application Support so iOS excludes it from
 // user-visible storage while keeping it backed up.
-static NSString *KelmaOpenRequestForProfile(NSString *profileId, NSError **error)
+static NSString *KelmaOpenRequestForProfile(NSString *profileId, NSString *timeZone, NSError **error)
 {
   NSFileManager *fm = [NSFileManager defaultManager];
   NSURL *support = [fm URLForDirectory:NSApplicationSupportDirectory
@@ -74,11 +74,18 @@ static NSString *KelmaOpenRequestForProfile(NSString *profileId, NSError **error
     return nil;
   }
 
-  NSDictionary *request = @{
+  NSMutableDictionary *request = [@{
     @"collectionPath": [profileDir URLByAppendingPathComponent:@"collection.anki2"].path,
     @"mediaFolderPath": [profileDir URLByAppendingPathComponent:@"collection.media"].path,
     @"mediaDbPath": [profileDir URLByAppendingPathComponent:@"collection.media.db2"].path,
-  };
+  } mutableCopy];
+  // Forwarded so the Rust core can set `TZ` before touching rslib's
+  // scheduler: chrono's OS timezone detection isn't reliably correct inside
+  // an embedded mobile Rust runtime, which can otherwise make the app compute
+  // a different "today" (and due-card order) than Anki Desktop/AnkiMobile.
+  if (timeZone.length > 0) {
+    request[@"timeZone"] = timeZone;
+  }
   NSData *json = [NSJSONSerialization dataWithJSONObject:request options:0 error:error];
   if (json == nil) {
     return nil;
@@ -119,8 +126,8 @@ static NSString *KelmaOpenRequestForProfile(NSString *profileId, NSError **error
       self->_session = nullptr;
     }
 
-    // The JS layer passes {profileId}; the native layer owns the filesystem
-    // layout and turns it into concrete collection paths.
+    // The JS layer passes {profileId, timeZone}; the native layer owns the
+    // filesystem layout and turns it into concrete collection paths.
     NSError *parseError = nil;
     NSData *requestData = [request dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
     NSDictionary *requestJson =
@@ -128,9 +135,12 @@ static NSString *KelmaOpenRequestForProfile(NSString *profileId, NSError **error
     NSString *profileId = [requestJson isKindOfClass:[NSDictionary class]]
         ? (requestJson[@"profileId"] ?: @"default")
         : @"default";
+    NSString *timeZone = [requestJson isKindOfClass:[NSDictionary class]]
+        ? requestJson[@"timeZone"]
+        : nil;
 
     NSError *pathError = nil;
-    NSString *openRequest = KelmaOpenRequestForProfile(profileId, &pathError);
+    NSString *openRequest = KelmaOpenRequestForProfile(profileId, timeZone, &pathError);
     if (openRequest == nil) {
       reject(@"KELMA_OPEN",
              pathError.localizedDescription ?: @"Unable to resolve the collection path.",

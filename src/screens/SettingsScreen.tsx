@@ -7,7 +7,7 @@ import { useEffect, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { SYNC_CLIENT_VERSION } from '../config';
 import { getSyncDebug, type SyncDebug } from '../core/KelmaCore';
-import { palette } from './theme';
+import { headerStyles, palette, radius, shadow, spacing } from './theme';
 
 type Props = {
   autoplayAudio: boolean;
@@ -33,10 +33,12 @@ export function SettingsScreen({
       style={styles.screen}
       contentContainerStyle={styles.content}
       alwaysBounceVertical>
-      <Text style={styles.eyebrow}>KELMA</Text>
-      <Text style={styles.title}>Settings</Text>
+      <View style={[headerStyles.titleRow, styles.titleRow]}>
+        <View style={headerStyles.accentTall} />
+        <Text style={styles.title}>Settings</Text>
+      </View>
 
-      <Text style={styles.sectionLabel}>REVIEWING</Text>
+      <Text style={styles.sectionLabel}>Reviewing</Text>
       <View style={styles.card}>
         <View style={styles.row}>
           <View style={styles.rowText}>
@@ -55,7 +57,7 @@ export function SettingsScreen({
         </View>
       </View>
 
-      <Text style={styles.sectionLabel}>SYNC</Text>
+      <Text style={styles.sectionLabel}>Sync</Text>
       <View style={styles.card}>
         <Text style={styles.rowTitle}>Anki-compatible Rust core</Text>
         <Text style={styles.rowDescription}>
@@ -63,7 +65,7 @@ export function SettingsScreen({
         </Text>
       </View>
 
-      <Text style={styles.sectionLabel}>SYNC DIAGNOSTICS</Text>
+      <Text style={styles.sectionLabel}>Sync diagnostics</Text>
       <View style={styles.card}>
         <Pressable onPress={loadDebug} style={styles.refreshRow}>
           <Text style={styles.rowTitle}>Collection sync state</Text>
@@ -94,7 +96,7 @@ export function SettingsScreen({
         </Text>
       </View>
 
-      <Text style={styles.sectionLabel}>ABOUT</Text>
+      <Text style={styles.sectionLabel}>About</Text>
       <View style={styles.card}>
         <Text style={styles.rowTitle}>Kelma Mobile 0.1.0</Text>
         <Text style={styles.rowDescription}>{SYNC_CLIENT_VERSION}</Text>
@@ -116,25 +118,18 @@ function DebugRow({ label, value }: { label: string; value: number }) {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: palette.background },
   content: { paddingHorizontal: 24, paddingTop: 36, paddingBottom: 40 },
-  eyebrow: {
-    color: palette.gold,
-    fontSize: 13,
-    fontWeight: '800',
-    letterSpacing: 3.2,
-    marginBottom: 10,
-  },
+  titleRow: { marginBottom: 28 },
   title: {
     color: palette.textPrimary,
-    fontSize: 34,
-    fontWeight: '700',
-    letterSpacing: -1,
-    marginBottom: 28,
+    fontSize: 38,
+    fontWeight: '800',
+    letterSpacing: -1.2,
   },
   sectionLabel: {
-    color: palette.textMuted,
-    fontSize: 12,
+    color: palette.textSecondary,
+    fontSize: 13,
     fontWeight: '800',
-    letterSpacing: 1.5,
+    letterSpacing: 0.2,
     marginTop: 18,
     marginBottom: 8,
   },
@@ -142,8 +137,9 @@ const styles = StyleSheet.create({
     backgroundColor: palette.surface,
     borderColor: palette.surfaceBorder,
     borderWidth: 1,
-    borderRadius: 16,
-    padding: 18,
+    borderRadius: radius.lg,
+    padding: spacing.lg + 2,
+    ...shadow.card,
   },
   row: { flexDirection: 'row', alignItems: 'center', gap: 18 },
   rowText: { flex: 1 },

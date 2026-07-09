@@ -32,6 +32,9 @@ export interface Spec extends TurboModule {
    * Run a coarse, rslib-backed operation against the open collection.
    * `op` is one of: "deckTree", "mediaDir", "setDeck", "nextCard",
    * "answerCard", "stats", "deckOverview", "browseDeck", "cardDetail",
+   * "suspendCard", "unsuspendCard", "buryCard", "setCardFlag",
+   * "setCardDeck", "deleteCard", "toggleCardMark", "getNoteEdit", "updateNote",
+   * "notetypes", "addNote", "checkNoteFields", "exportDeck", "importApkg",
    * "pendingChanges", "getSyncAuth", "setSyncAuth", "clearSyncAuth",
    * "syncDebug", "syncLogin", "syncCollection", "syncMedia", "syncStatus",
    * "fullSync".
