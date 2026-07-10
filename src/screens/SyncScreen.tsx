@@ -19,12 +19,24 @@ import {
 } from 'react-native';
 import { DEFAULT_SYNC_ENDPOINT, KELMA_SIGNUP_URL } from '../config';
 import {
+  acceptServerNote,
+  diffDeckNotes,
+  diffManifests,
   fullSyncMonitored,
+  generateNoteGuid,
+  getLocalManifest,
+  getLocalNoteDetail,
+  getServerManifest,
+  getServerNoteDetail,
   resetMedia,
   syncCollection,
   syncLogin,
   syncMediaMonitored,
+  writeServerNote,
+  type DeckDiff,
   type FullSyncProgress,
+  type Manifest,
+  type NoteDiff,
   type SyncAuth,
 } from '../core/KelmaCore';
 import { headerStyles, palette, radius, shadow } from './theme';
@@ -253,6 +265,15 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
     [onSynced, updateStep, pushLog],
   );
 
+  // Forget the stored credentials and return to the login form. Used by the
+  // explicit control and automatically when the server rejects the stored key.
+  const signOut = useCallback(() => {
+    setAuth(null);
+    setEmail('');
+    setPassword('');
+    onSignedOut();
+  }, [onSignedOut]);
+
   const start = useCallback(
     (forceFullDownload: boolean) => {
       setBusy(true);
@@ -311,19 +332,119 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
         })
         .finally(() => setBusy(false));
     },
-    [auth, email, password, onSignedIn, performSync, pushLog, updateStep],
+    [auth, email, password, onSignedIn, performSync, pushLog, signOut, updateStep],
   );
 
   const sync = () => start(false);
 
-  // Forget the stored credentials and return to the login form. Used by the
-  // explicit control and automatically when the server rejects the stored key.
-  const signOut = useCallback(() => {
-    setAuth(null);
-    setEmail('');
-    setPassword('');
-    onSignedOut();
-  }, [onSignedOut]);
+  // --- Compare: fetch both manifests and show the user what differs -------
+  const [comparing, setComparing] = useState(false);
+  const [diffs, setDiffs] = useState<DeckDiff[] | null>(null);
+  const [compareManifests, setCompareManifests] = useState<{ local: Manifest; server: Manifest } | null>(null);
+  const [expandedDeck, setExpandedDeck] = useState<string | null>(null);
+  const [compareError, setCompareError] = useState<string | null>(null);
+
+  const compareWithServer = useCallback(async () => {
+    if (!auth) return;
+    setComparing(true);
+    setCompareError(null);
+    setDiffs(null);
+    setCompareManifests(null);
+    setExpandedDeck(null);
+    try {
+      const [local, server] = await Promise.all([
+        getLocalManifest(),
+        getServerManifest(auth),
+      ]);
+      setCompareManifests({ local, server });
+      setDiffs(diffManifests(local, server));
+    } catch (e) {
+      setCompareError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setComparing(false);
+    }
+  }, [auth]);
+
+  // Per-note resolution actions. `resolving` holds the note key currently in
+  // flight so we can disable its buttons and show progress.
+  const [resolving, setResolving] = useState<string | null>(null);
+
+  const resolveNote = useCallback(
+    async (n: NoteDiff, action: 'accept' | 'force' | 'guid') => {
+      if (!auth) return;
+      const key = `${n.guid}:${n.local?.nid ?? 'x'}:${n.server?.nid ?? 'x'}`;
+      setResolving(key);
+      try {
+        if (action === 'guid') {
+          const nid = n.local?.nid;
+          if (!nid) throw new Error('no local note');
+          await generateNoteGuid(nid);
+        } else if (action === 'accept') {
+          const nid = n.local?.nid;
+          const serverNid = n.server?.nid ?? 0;
+          if (!nid) throw new Error('no local note to overwrite');
+          const detail = await getServerNoteDetail(auth, serverNid, n.guid);
+          if (!detail) throw new Error('server note not found');
+          await acceptServerNote(nid, detail);
+        } else {
+          const nid = n.local?.nid;
+          if (!nid) throw new Error('no local note to push');
+          const detail = await getLocalNoteDetail(nid, n.guid);
+          if (!detail) throw new Error('local note not found');
+          if (!detail.guid) {
+            throw new Error('empty GUID — generate one first');
+          }
+          await writeServerNote(auth, detail);
+        }
+        // Refresh the compare so the resolved note drops out of the diff.
+        await compareWithServer();
+      } catch (e) {
+        Alert.alert('Resolve failed', e instanceof Error ? e.message : String(e));
+      } finally {
+        setResolving(null);
+      }
+    },
+    [auth, compareWithServer],
+  );
+
+  const statusLabel: Record<DeckDiff['status'], string> = {
+    'in-sync': '✓ in sync',
+    'local-newer': '↑ local newer',
+    'server-newer': '↓ server newer',
+    'server-only': '↓ server only',
+    'local-only': '↑ local only',
+    'conflict': '⚠ conflict',
+  };
+  const statusColor: Record<DeckDiff['status'], string> = {
+    'in-sync': palette.good,
+    'local-newer': palette.gold,
+    'server-newer': palette.gold,
+    'server-only': palette.textSecondary,
+    'local-only': palette.textSecondary,
+    'conflict': palette.bad,
+  };
+  const noteStatusLabel: Record<NoteDiff['status'], string> = {
+    'in-sync': '✓ in sync',
+    conflict: '⚠ conflict',
+    'card-count': 'cards differ',
+    'local-newer': '↑ local newer',
+    'server-newer': '↓ server newer',
+    'local-only': '↑ local only',
+    'server-only': '↓ server only',
+    'local-extra': '↑ extra local duplicate',
+    'server-extra': '↓ extra server duplicate',
+  };
+  const noteStatusColor: Record<NoteDiff['status'], string> = {
+    'in-sync': palette.good,
+    conflict: palette.bad,
+    'card-count': palette.gold,
+    'local-newer': palette.gold,
+    'server-newer': palette.gold,
+    'local-only': palette.textSecondary,
+    'server-only': palette.textSecondary,
+    'local-extra': palette.textSecondary,
+    'server-extra': palette.textSecondary,
+  };
 
   const resetFromServer = () => {
     Alert.alert(
@@ -433,6 +554,130 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
               </View>
             ))}
           </View>
+
+          {/* Compare: show the server's state before committing to a sync. */}
+          {auth && (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Compare local with server"
+              disabled={busy || comparing}
+              onPress={compareWithServer}
+              style={({ pressed }) => [
+                styles.compareButton,
+                (busy || comparing) && styles.disabled,
+                pressed && styles.pressed,
+              ]}>
+              {comparing ? (
+                <ActivityIndicator size="small" color={palette.textPrimary} />
+              ) : (
+                <Text style={styles.compareButtonText}>Compare with server</Text>
+              )}
+            </Pressable>
+          )}
+
+          {compareError && (
+            <Text style={styles.compareError}>Compare failed: {compareError}</Text>
+          )}
+
+          {diffs && (
+            <View style={styles.diffPanel}>
+              <Text style={styles.diffTitle}>
+                {diffs.filter(d => d.status !== 'in-sync').length} different ·{' '}
+                {diffs.filter(d => d.status === 'in-sync').length} in sync
+              </Text>
+              <ScrollView style={styles.diffScroll} nestedScrollEnabled>
+                {diffs.filter(d => d.status !== 'in-sync').map(d => {
+                  const noteDiffs = compareManifests && d.status === 'conflict'
+                    ? diffDeckNotes(compareManifests.local, compareManifests.server, d)
+                    : [];
+                  const visibleNotes = noteDiffs.filter(n => n.status !== 'in-sync');
+                  const expanded = expandedDeck === d.deck.name;
+                  return (
+                    <View key={d.deck.name}>
+                      <Pressable
+                        accessibilityRole="button"
+                        onPress={() => setExpandedDeck(expanded ? null : d.deck.name)}
+                        style={({ pressed }) => [styles.diffRow, pressed && styles.pressed]}>
+                        <Text style={styles.diffDeckName} numberOfLines={1}>
+                          {d.deck.name}
+                        </Text>
+                        <Text
+                          style={[
+                            styles.diffStatus,
+                            { color: statusColor[d.status] },
+                          ]}>
+                          {statusLabel[d.status]}{visibleNotes.length ? ` · ${visibleNotes.length}` : ''}
+                        </Text>
+                      </Pressable>
+                      {expanded && d.status === 'conflict' && (
+                        <View style={styles.noteDiffPanel}>
+                          {visibleNotes.length === 0 ? (
+                            <Text style={styles.noteDiffEmpty}>No note-level differences found.</Text>
+                          ) : visibleNotes.map((n, index) => (
+                            <View key={`${n.guid || 'empty'}:${n.local?.nid ?? 'x'}:${n.server?.nid ?? 'x'}:${index}`} style={styles.noteDiffRow}>
+                              <Text style={styles.notePreview} numberOfLines={2}>{n.preview}</Text>
+                              <Text style={[styles.noteStatus, { color: noteStatusColor[n.status] }]}>
+                                {noteStatusLabel[n.status]}
+                              </Text>
+                              <Text style={styles.noteMeta}>
+                                local cards {n.local?.cards_per_deck?.reduce((a, b) => a + b, 0) ?? 0} · server cards {n.server?.cards_per_deck?.reduce((a, b) => a + b, 0) ?? 0}
+                                {n.guid === '' ? ' · empty GUID' : ''}
+                              </Text>
+                              {(() => {
+                                const key = `${n.guid}:${n.local?.nid ?? 'x'}:${n.server?.nid ?? 'x'}`;
+                                const busyNote = resolving === key;
+                                const disabled = resolving != null;
+                                return (
+                                  <View style={styles.noteActions}>
+                                    {n.guid === '' && n.local?.nid ? (
+                                      <Pressable
+                                        accessibilityRole="button"
+                                        disabled={disabled}
+                                        onPress={() => resolveNote(n, 'guid')}
+                                        style={({ pressed }) => [styles.noteActionBtn, pressed && styles.pressed, disabled && styles.disabled]}>
+                                        <Text style={styles.noteActionText}>{busyNote ? '…' : 'Generate GUID'}</Text>
+                                      </Pressable>
+                                    ) : null}
+                                    {n.server?.nid && n.local?.nid ? (
+                                      <Pressable
+                                        accessibilityRole="button"
+                                        disabled={disabled}
+                                        onPress={() => resolveNote(n, 'accept')}
+                                        style={({ pressed }) => [styles.noteActionBtn, pressed && styles.pressed, disabled && styles.disabled]}>
+                                        <Text style={styles.noteActionText}>{busyNote ? '…' : '↓ Accept server'}</Text>
+                                      </Pressable>
+                                    ) : null}
+                                    {n.local?.nid && n.guid !== '' ? (
+                                      <Pressable
+                                        accessibilityRole="button"
+                                        disabled={disabled}
+                                        onPress={() => resolveNote(n, 'force')}
+                                        style={({ pressed }) => [styles.noteActionBtn, styles.noteActionBtnPush, pressed && styles.pressed, disabled && styles.disabled]}>
+                                        <Text style={styles.noteActionText}>{busyNote ? '…' : '↑ Force local'}</Text>
+                                      </Pressable>
+                                    ) : null}
+                                  </View>
+                                );
+                              })()}
+                            </View>
+                          ))}
+                        </View>
+                      )}
+                    </View>
+                  );
+                })}
+                {diffs.every(d => d.status === 'in-sync') && (
+                  <Text style={styles.diffAllMatching}>
+                    Everything matches the server.
+                  </Text>
+                )}
+              </ScrollView>
+              <Text style={styles.diffHint}>
+                Syncing applies newest-wins per note. The diff above shows what
+                will change.
+              </Text>
+            </View>
+          )}
 
           <Pressable
             accessibilityRole="button"
@@ -662,6 +907,130 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginTop: 4,
     ...shadow.card,
+  },
+  compareButton: {
+    minHeight: 44,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: palette.surfaceBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 10,
+  },
+  compareButtonText: {
+    color: palette.textPrimary,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  compareError: {
+    color: palette.bad,
+    fontSize: 12,
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  diffPanel: {
+    marginTop: 10,
+    borderTopColor: palette.surfaceBorder,
+    borderTopWidth: 1,
+    paddingTop: 10,
+  },
+  diffTitle: {
+    color: palette.textSecondary,
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 6,
+  },
+  diffScroll: {
+    maxHeight: 200,
+    backgroundColor: palette.background,
+    borderRadius: 8,
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    padding: 10,
+  },
+  diffRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 3,
+  },
+  diffDeckName: {
+    color: palette.textPrimary,
+    fontSize: 13,
+    flex: 1,
+    marginRight: 8,
+  },
+  diffStatus: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  noteDiffPanel: {
+    marginLeft: 8,
+    marginBottom: 6,
+    borderLeftColor: palette.surfaceBorder,
+    borderLeftWidth: 2,
+    paddingLeft: 8,
+    gap: 6,
+  },
+  noteDiffRow: {
+    borderBottomColor: palette.surfaceBorder,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 6,
+  },
+  notePreview: {
+    color: palette.textPrimary,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  noteStatus: {
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  noteMeta: {
+    color: palette.textMuted,
+    fontSize: 10,
+    marginTop: 2,
+  },
+  noteActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 6,
+  },
+  noteActionBtn: {
+    borderWidth: 1,
+    borderColor: palette.surfaceBorder,
+    borderRadius: radius.sm,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+  },
+  noteActionBtnPush: {
+    borderColor: palette.gold,
+  },
+  noteActionText: {
+    color: palette.textPrimary,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  noteDiffEmpty: {
+    color: palette.textMuted,
+    fontSize: 12,
+    paddingVertical: 6,
+  },
+  diffAllMatching: {
+    color: palette.good,
+    fontSize: 13,
+    textAlign: 'center',
+    paddingVertical: 6,
+  },
+  diffHint: {
+    color: palette.textMuted,
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 6,
   },
   disabled: { opacity: 0.45 },
   pressed: { opacity: 0.75 },

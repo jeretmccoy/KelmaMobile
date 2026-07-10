@@ -27,6 +27,7 @@ use anki_proto::decks::DeckTreeNode;
 use anki_proto::generic::StringList;
 use anki::import_export::package::ExportAnkiPackageOptions;
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 /// A long-lived handle owning one open collection. The platform layer keeps a
@@ -1046,6 +1047,454 @@ impl KelmaSession {
         })
     }
 
+    /// Local collection manifest — the same shape as the server's `/sync/inspect`
+    /// response, computed from the local collection. Used by the compare view to
+    /// diff local vs server before syncing. See the KelmaSync REDESIGN doc.
+    pub fn local_manifest(&self) -> Result<Value, String> {
+        use sha2::{Digest, Sha256};
+        use std::collections::HashMap;
+
+        // Clone the media.db path so we can query it outside `with_col` (which
+        // borrows the collection). The media.db is a separate SQLite file.
+        let media_db_path = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            guard.media_db_path.clone()
+        };
+
+        // Collection queries run inside `with_col` so rusqlite::Error converts
+        // to AnkiError (rslib implements From<rusqlite::Error>) and then to
+        // String — same pattern as `sync_debug`.
+        let mut manifest = self.with_col(|col| {
+            let db = col.storage.db();
+
+            // Collection-level meta.
+            let (mod_, scm, usn, ver): (i64, i64, i64, i64) = db
+                .query_row("SELECT mod, scm, usn, ver FROM col", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap_or((0, 0, 0, 0));
+
+            let mut deck_names: HashMap<i64, String> = HashMap::new();
+            // Schema 15+ stores decks in a normalized table. Fall back to the
+            // legacy col.decks JSON for old collections.
+            if let Ok(mut stmt) = db.prepare("SELECT id, name FROM decks") {
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, name) = row?;
+                    deck_names.insert(id, name);
+                }
+            } else {
+                let decks_json: String = db
+                    .query_row("SELECT decks FROM col", [], |r| r.get(0))
+                    .unwrap_or_default();
+                let deck_map: HashMap<String, Value> =
+                    serde_json::from_str(&decks_json).unwrap_or_default();
+                for (_key, val) in &deck_map {
+                    if let (Some(id), Some(name)) = (
+                        val.get("id").and_then(|v| v.as_i64()),
+                        val.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        deck_names.insert(id, name.to_string());
+                    }
+                }
+            }
+
+            // Per-deck card counts.
+            let mut card_counts: HashMap<i64, i64> = HashMap::new();
+            {
+                let mut stmt = db.prepare("SELECT did, COUNT(*) FROM cards GROUP BY did")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })?;
+                for row in rows {
+                    let (did, cnt) = row?;
+                    card_counts.insert(did, cnt);
+                }
+            }
+
+            // DISTINCT collapses multiple card templates for one note in a
+            // deck, while retaining notes whose cards span multiple decks.
+            let mut deck_hashes: HashMap<i64, Sha256> = HashMap::new();
+            let mut deck_note_counts: HashMap<i64, i64> = HashMap::new();
+            let mut deck_mods: HashMap<i64, i64> = HashMap::new();
+            // Per-note deck membership + card counts, keyed by nid so
+            // duplicate/empty GUID notes don't collapse into one entry.
+            let mut note_decks: HashMap<i64, Vec<i64>> = HashMap::new();
+            let mut note_cards: HashMap<i64, HashMap<i64, i64>> = HashMap::new();
+            {
+                let mut stmt = db.prepare(
+                    "SELECT DISTINCT c.did, n.guid, n.mod, n.id, n.flds \
+                     FROM cards c JOIN notes n ON c.nid = n.id \
+                     ORDER BY c.did, n.guid, n.id",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (did, guid, nmod, nid, flds) = row?;
+                    note_decks.entry(nid).or_default().push(did);
+                    *deck_note_counts.entry(did).or_default() += 1;
+                    deck_mods
+                        .entry(did)
+                        .and_modify(|current| *current = (*current).max(nmod))
+                        .or_insert(nmod);
+                    let hasher = deck_hashes.entry(did).or_default();
+                    hasher.update(guid.as_bytes());
+                    hasher.update(b"\x1f");
+                    hasher.update(nmod.to_le_bytes());
+                    hasher.update(b"\x1f");
+                    hasher.update(flds.as_bytes());
+                    hasher.update(b"\x1e");
+                }
+            }
+            {
+                let mut stmt = db.prepare(
+                    "SELECT n.id, c.did, COUNT(*) \
+                     FROM cards c JOIN notes n ON c.nid = n.id \
+                     GROUP BY n.id, c.did",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })?;
+                for row in rows {
+                    let (nid, did, cnt) = row?;
+                    note_cards.entry(nid).or_default().insert(did, cnt);
+                }
+            }
+
+            // Build the deck list, sorted by name.
+            let mut decks: Vec<Value> = deck_names
+                .iter()
+                .map(|(id, name)| {
+                    let cards = card_counts.get(id).copied().unwrap_or(0);
+                    let notes = deck_note_counts.get(id).copied().unwrap_or(0);
+                    let max_mod = deck_mods.get(id).copied().unwrap_or(0);
+                    let hash = deck_hashes
+                        .get(id)
+                        .map(|h| {
+                            let h = h.clone();
+                            let result = h.finalize();
+                            let mut hex = String::with_capacity(result.len() * 2);
+                            for b in result {
+                                hex.push_str(&format!("{b:02x}"));
+                            }
+                            format!("sha256:{hex}")
+                        })
+                        .unwrap_or_else(|| {
+                            let result = Sha256::digest([]);
+                            let mut hex = String::with_capacity(result.len() * 2);
+                            for b in result {
+                                hex.push_str(&format!("{b:02x}"));
+                            }
+                            format!("sha256:{hex}")
+                        });
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "cards": cards,
+                        "notes": notes,
+                        "mod": max_mod,
+                        "hash": hash,
+                    })
+                })
+                .collect();
+            decks.sort_by(|a, b| {
+                a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+            });
+
+            // Full notes list (the drill-in diff data).
+            let mut notes: Vec<Value> = Vec::new();
+            {
+                let mut stmt = db.prepare("SELECT id, guid, mid, mod, flds FROM notes ORDER BY guid")?;
+                let rows = stmt.query_map([], |r| {
+                    let nid: i64 = r.get(0)?;
+                    let guid: String = r.get(1)?;
+                    let flds: String = r.get(4)?;
+                    let decks = note_decks.remove(&nid).unwrap_or_default();
+                    let card_map = note_cards.remove(&nid).unwrap_or_default();
+                    let cards_per_deck: Vec<i64> = decks
+                        .iter()
+                        .map(|did| card_map.get(did).copied().unwrap_or(0))
+                        .collect();
+                    let field_hash = Sha256::digest(flds.as_bytes());
+                    let mut field_hex = String::with_capacity(field_hash.len() * 2);
+                    for b in field_hash {
+                        field_hex.push_str(&format!("{b:02x}"));
+                    }
+                    Ok(json!({
+                        "guid": guid,
+                        "nid": nid,
+                        "mid": r.get::<_, i64>(2)?,
+                        "mod": r.get::<_, i64>(3)?,
+                        "decks": decks,
+                        "cards_per_deck": cards_per_deck,
+                        "hash": format!("sha256:{field_hex}"),
+                        "preview": note_preview(&flds),
+                    }))
+                })?;
+                for row in rows {
+                    notes.push(row?);
+                }
+            }
+
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            Ok(json!({
+                "ts": ts,
+                "mod": mod_,
+                "scm": scm,
+                "usn": usn,
+                "schema": ver,
+                "decks": decks,
+                "notes": notes,
+            }))
+        })?;
+
+        // Media.db summary (may not exist on a fresh install).
+        manifest["media"] = media_manifest_from_path(&media_db_path);
+
+        Ok(manifest)
+    }
+
+    /// Fetch the server's manifest via `GET /sync/inspect`. `request` is
+    /// `{hkey, endpoint}` (same shape as `syncCollection`). Returns the server's
+    /// read-only collection state for the compare view.
+    pub fn server_manifest(&self, request: &Value) -> Result<Value, String> {
+        let auth = sync_auth_from(request)?;
+        let endpoint = auth
+            .endpoint
+            .as_ref()
+            .map(|u| u.as_str().trim_end_matches('/'))
+            .unwrap_or("");
+        if endpoint.is_empty() {
+            return Err("missing endpoint".into());
+        }
+        // Optional `since=<usn>`: return only notes changed past that usn.
+        let url = match request.get("since").and_then(Value::as_i64) {
+            Some(s) => format!("{endpoint}/sync/inspect?since={s}"),
+            None => format!("{endpoint}/sync/inspect"),
+        };
+        let header = json!({
+            "v": 11,
+            "k": auth.hkey,
+            "c": format!("kelma-mobile:{}", crate::ANKI_VERSION),
+            "s": "",
+        })
+        .to_string();
+
+        let resp = block_on(async {
+            web_client()
+                .get(&url)
+                .header("anki-sync", &header)
+                .send()
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .error_for_status()
+                .map_err(|e| format!("{e:?}"))?
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("{e:?}"))
+        })?;
+        Ok(resp)
+    }
+
+    /// Full field/card content for one *local* note, by nid (preferred) or
+    /// guid. Mirrors the server's `NoteDetail` shape for the compare drill-in.
+    /// `request` is `{nid?, guid?}`.
+    pub fn local_note_detail(&self, request: &Value) -> Result<Value, String> {
+        let nid = request.get("nid").and_then(Value::as_i64).unwrap_or(0);
+        let guid = request.get("guid").and_then(Value::as_str).unwrap_or("");
+        self.with_col(|col| {
+            let db = col.storage.db();
+            let row: Option<(i64, String, i64, i64, String, String)> = if nid != 0 {
+                db.query_row(
+                    "SELECT id, guid, mid, mod, flds, tags FROM notes WHERE id = ?",
+                    [nid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()?
+            } else {
+                db.query_row(
+                    "SELECT id, guid, mid, mod, flds, tags FROM notes WHERE guid = ?",
+                    [guid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()?
+            };
+            let Some((nid_, guid_, mid, mod_, flds, tags)) = row else {
+                return Ok(Value::Null);
+            };
+            let mut cards: Vec<Value> = Vec::new();
+            {
+                let mut stmt =
+                    db.prepare("SELECT ord, did FROM cards WHERE nid = ? ORDER BY ord")?;
+                let rows = stmt.query_map([nid_], |r| {
+                    Ok(json!({ "ord": r.get::<_, i64>(0)?, "did": r.get::<_, i64>(1)? }))
+                })?;
+                for row in rows {
+                    cards.push(row?);
+                }
+            }
+            Ok(json!({
+                "guid": guid_, "nid": nid_, "mid": mid, "mod": mod_,
+                "flds": flds, "tags": tags, "cards": cards,
+            }))
+        })
+    }
+
+    /// Fetch one note's full content from the server via
+    /// `GET /sync/inspect/note`. `request` is `{hkey, endpoint, nid?, guid?}`.
+    pub fn server_note_detail(&self, request: &Value) -> Result<Value, String> {
+        let auth = sync_auth_from(request)?;
+        let endpoint = auth
+            .endpoint
+            .as_ref()
+            .map(|u| u.as_str().trim_end_matches('/'))
+            .unwrap_or("");
+        if endpoint.is_empty() {
+            return Err("missing endpoint".into());
+        }
+        let nid = request.get("nid").and_then(Value::as_i64).unwrap_or(0);
+        let guid = request.get("guid").and_then(Value::as_str).unwrap_or("");
+        let mut url = format!("{endpoint}/sync/inspect/note?guid={}", urlencode(guid));
+        if nid != 0 {
+            url.push_str(&format!("&nid={nid}"));
+        }
+        let header = inspect_header(&auth.hkey);
+        let resp = block_on(async {
+            let r = web_client()
+                .get(&url)
+                .header("anki-sync", &header)
+                .send()
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            if r.status().as_u16() == 404 {
+                return Ok(Value::Null);
+            }
+            r.error_for_status()
+                .map_err(|e| format!("{e:?}"))?
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("{e:?}"))
+        })?;
+        Ok(resp)
+    }
+
+    /// Write a local note to the server ("force local → server") via
+    /// `PUT /sync/notes/:guid`. `request` is `{hkey, endpoint, note}` where
+    /// `note` is a local_note_detail shape.
+    pub fn write_server_note(&self, request: &Value) -> Result<Value, String> {
+        let auth = sync_auth_from(request)?;
+        let endpoint = auth
+            .endpoint
+            .as_ref()
+            .map(|u| u.as_str().trim_end_matches('/'))
+            .unwrap_or("");
+        if endpoint.is_empty() {
+            return Err("missing endpoint".into());
+        }
+        let note = request.get("note").ok_or("missing 'note'")?;
+        let guid = note.get("guid").and_then(Value::as_str).unwrap_or("");
+        if guid.is_empty() {
+            return Err("cannot push a note with an empty GUID".into());
+        }
+        let body = json!({
+            "guid": guid,
+            "mid": note.get("mid").and_then(Value::as_i64).unwrap_or(0),
+            "mod": note.get("mod").and_then(Value::as_i64).unwrap_or(0),
+            "flds": note.get("flds").and_then(Value::as_str).unwrap_or(""),
+            "tags": note.get("tags").and_then(Value::as_str).unwrap_or(""),
+            "cards": note.get("cards").cloned().unwrap_or(json!([])),
+        });
+        let url = format!("{endpoint}/sync/notes/{}", urlencode(guid));
+        let header = inspect_header(&auth.hkey);
+        let resp = block_on(async {
+            web_client()
+                .put(&url)
+                .header("anki-sync", &header)
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .error_for_status()
+                .map_err(|e| format!("{e:?}"))?
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("{e:?}"))
+        })?;
+        Ok(resp)
+    }
+
+    /// Update a local note to match a server note ("accept server"). `request`
+    /// is `{nid, server}` where `server` is a NoteDetail shape. Uses rslib's
+    /// `update_notes`, which regenerates cards. Returns `{saved:true}`.
+    pub fn accept_server_note(&self, request: &Value) -> Result<Value, String> {
+        let nid = i64_field(request, "nid")?;
+        let server = request.get("server").ok_or("missing 'server'")?;
+        let flds = server
+            .get("flds")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split('\u{1f}')
+            .map(|s| s.to_owned())
+            .collect::<Vec<_>>();
+        let tags = server
+            .get("tags")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split_whitespace()
+            .map(|s| s.to_owned())
+            .collect::<Vec<_>>();
+        let mid = server.get("mid").and_then(Value::as_i64).unwrap_or(0);
+        self.with_col(|col| {
+            col.update_notes(anki_proto::notes::UpdateNotesRequest {
+                notes: vec![anki_proto::notes::Note {
+                    id: nid,
+                    guid: String::new(),
+                    notetype_id: mid,
+                    mtime_secs: 0,
+                    usn: 0,
+                    tags,
+                    fields: flds,
+                }],
+                skip_undo_entry: false,
+            })?;
+            Ok(json!({ "saved": true }))
+        })
+    }
+
+    /// Assign a unique GUID to a local note that lacks one (fixes empty-GUID
+    /// duplicate ambiguity). `request` is `{nid}`. Returns `{guid}`.
+    pub fn generate_note_guid(&self, request: &Value) -> Result<Value, String> {
+        let nid = i64_field(request, "nid")?;
+        self.with_col(|col| {
+            let new_guid = gen_guid();
+            col.storage
+                .db()
+                .execute("UPDATE notes SET guid = ? WHERE id = ?", (&new_guid, nid))?;
+            Ok(json!({ "guid": new_guid }))
+        })
+    }
+
     /// Exchange username/password for a sync host key against the given
     /// endpoint. `request` is `{username, password, endpoint}`.
     pub fn sync_login(&self, request: &Value) -> Result<Value, String> {
@@ -1530,6 +1979,106 @@ fn rating_from_u64(value: u64) -> Result<Rating, String> {
         2 => Ok(Rating::Good),
         3 => Ok(Rating::Easy),
         other => Err(format!("invalid rating {other}")),
+    }
+}
+
+/// Anki-compatible sync header for the Kelma-native inspect/write endpoints.
+fn inspect_header(hkey: &str) -> String {
+    json!({
+        "v": 11,
+        "k": hkey,
+        "c": format!("kelma-mobile:{}", crate::ANKI_VERSION),
+        "s": "",
+    })
+    .to_string()
+}
+
+/// Percent-encode a query/path value (Anki GUIDs contain URL-unsafe base91
+/// chars). Encodes everything that isn't an unreserved char.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Generate a unique base91 GUID, matching rslib's note-guid alphabet.
+fn gen_guid() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = nanos ^ (c.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    anki::notes::to_base_n(
+        n,
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\
+0123456789!#$%&()*+,-./:;<=>?@[]^_`{|}~",
+    )
+}
+
+fn note_preview(flds: &str) -> String {
+    let first = flds.split('\u{1f}').next().unwrap_or("");
+    let mut plain = String::new();
+    let mut in_tag = false;
+    for ch in first.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => plain.push(ch),
+            _ => {}
+        }
+    }
+    let decoded = plain
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 120 {
+        let mut out = collapsed.chars().take(120).collect::<String>();
+        out.push('…');
+        out
+    } else {
+        collapsed
+    }
+}
+
+/// Read `media.db`'s `meta` row (last_usn + total_nonempty_files) for the local
+/// manifest. Returns zeros if the file doesn't exist or isn't a valid media db.
+fn media_manifest_from_path(media_db_path: &str) -> Value {
+    use rusqlite::OpenFlags;
+    if media_db_path.is_empty() {
+        return json!({ "usn": 0, "files": 0 });
+    }
+    let path = std::path::Path::new(media_db_path);
+    if !path.exists() {
+        return json!({ "usn": 0, "files": 0 });
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return json!({ "usn": 0, "files": 0 }),
+    };
+    let row: Option<(i64, i64)> = conn
+        .query_row("SELECT last_usn, total_nonempty_files FROM meta", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok();
+    match row {
+        Some((usn, files)) => json!({ "usn": usn, "files": files }),
+        None => json!({ "usn": 0, "files": 0 }),
     }
 }
 

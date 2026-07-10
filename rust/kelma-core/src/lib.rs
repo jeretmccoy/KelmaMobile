@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use crate::session::KelmaSession;
 
 
-const ANKI_VERSION: &str = "25.09.2";
+pub const ANKI_VERSION: &str = "25.09.2";
 const ANKI_COMMIT: &str = "3890e12c9e48c028c3f12aa58cb64bd9f8895e30";
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -356,6 +356,13 @@ fn dispatch_session(session: &KelmaSession, op: &str, input: &[u8]) -> Result<St
         "setSyncAuth" => session.set_sync_auth(&request)?,
         "clearSyncAuth" => session.clear_sync_auth()?,
         "syncDebug" => session.sync_debug()?,
+        "localManifest" => session.local_manifest()?,
+        "serverManifest" => session.server_manifest(&request)?,
+        "localNoteDetail" => session.local_note_detail(&request)?,
+        "serverNoteDetail" => session.server_note_detail(&request)?,
+        "writeServerNote" => session.write_server_note(&request)?,
+        "acceptServerNote" => session.accept_server_note(&request)?,
+        "generateNoteGuid" => session.generate_note_guid(&request)?,
         "syncLogin" => session.sync_login(&request)?,
         "syncCollection" => session.sync_collection(&request)?,
         "syncMedia" => session.sync_media(&request)?,

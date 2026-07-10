@@ -55,10 +55,10 @@ class NativeKelmaCoreModule(
 
       "nextCard" -> """{"counts":{"new":0,"learning":0,"review":0},"card":null}"""
       "browseDeck" -> """{"cards":[]}"""
-      "pendingChanges" -> """{"pending":false}"""
+      "pendingChanges" -> """{"hasChanges":false,"lastSyncMs":0,"decks":[]}"""
       "getSyncAuth" -> "null"
       "syncStatus" -> """{"status":"idle","message":"Android emulator stub"}"""
-      "syncDebug" -> """{"ok":true,"message":"Android emulator stub"}"""
+      "syncDebug" -> """{"col":{"mod":0,"scm":0,"ls":0,"usn":0},"pendingCards":0,"pendingNotes":0,"pendingRevlogs":0,"pendingGraves":0,"totalCards":0,"totalRevlogs":0}"""
       "setDeck", "answerCard", "setSyncAuth", "clearSyncAuth", "syncLogin", "syncCollection", "syncMedia", "fullSync", "writeCardHtml" -> "{}"
       else -> "{}"
     }

@@ -2813,6 +2813,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tokio",
  "url",
 ]

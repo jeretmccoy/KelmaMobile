@@ -613,6 +613,272 @@ export async function getSyncDebug(): Promise<SyncDebug> {
   return runOp<SyncDebug>('syncDebug');
 }
 
+// --- Inspect / compare (visible server state) ----------------------------------
+
+/** Per-deck summary in a collection manifest. */
+export type DeckManifest = {
+  id: number;
+  name: string;
+  cards: number;
+  notes: number;
+  /** Max note modified time in this deck (unix seconds). */
+  mod: number;
+  /** `sha256:` + hex of the deck's `(guid, mod, flds)` tuples. Stable across
+   *  collections (guid-keyed), so two collections with the same notes at the
+   *  same mtimes produce the same hash → “in sync”. */
+  hash: string;
+};
+
+/** Per-note entry in a collection manifest — the drill-in diff data. */
+export type NoteManifest = {
+  guid: string;
+  nid: number;
+  mid: number;
+  mod: number;
+  decks?: number[];
+  cards_per_deck?: number[];
+  hash?: string;
+  preview?: string;
+};
+
+/** Media.db summary in a collection manifest. */
+export type MediaManifest = {
+  usn: number;
+  files: number;
+};
+
+/** The full collection manifest returned by `/sync/inspect` and
+ *  `localManifest`. Same shape on both sides so the compare view can diff them
+ *  field-by-field. See `docs/REDESIGN.md`. */
+export type Manifest = {
+  ts: number;
+  mod: number;
+  scm: number;
+  usn: number;
+  schema: number;
+  decks: DeckManifest[];
+  notes: NoteManifest[];
+  media: MediaManifest;
+};
+
+/** The local collection's manifest, for diffing against the server's. */
+export async function getLocalManifest(): Promise<Manifest> {
+  return runOp<Manifest>('localManifest');
+}
+
+/** Fetch the server's read-only manifest via `GET /sync/inspect`. When
+ *  `since` is given, only notes whose usn advanced past it are returned. */
+export async function getServerManifest(
+  auth: SyncAuth,
+  since?: number,
+): Promise<Manifest> {
+  return runOp<Manifest>('serverManifest', since == null ? auth : { ...auth, since });
+}
+
+/** Full field/card content for one note, on either side. Mirrors the
+ *  server's `NoteDetail` shape so the drill-in can diff field-by-field. */
+export type NoteDetail = {
+  guid: string;
+  nid: number;
+  mid: number;
+  mod: number;
+  flds: string;
+  tags: string;
+  cards: { ord: number; did: number }[];
+};
+
+export type WriteOutcome = {
+  action: string;
+  nid: number;
+  usn: number;
+  cards_added: number[];
+  cards_deleted: number[];
+};
+
+/** Read one local note's full content (by nid, or guid fallback). */
+export async function getLocalNoteDetail(
+  nid: number,
+  guid?: string,
+): Promise<NoteDetail | null> {
+  return runOp<NoteDetail | null>('localNoteDetail', { nid, guid: guid ?? '' });
+}
+
+/** Fetch one note's full content from the server (`GET /sync/inspect/note`). */
+export async function getServerNoteDetail(
+  auth: SyncAuth,
+  nid: number,
+  guid?: string,
+): Promise<NoteDetail | null> {
+  return runOp<NoteDetail | null>('serverNoteDetail', {
+    ...auth,
+    nid,
+    guid: guid ?? '',
+  });
+}
+
+/** Force a local note onto the server ("force local → server") via
+ *  `PUT /sync/notes/:guid`. Bumps the server note's usn; no full sync. */
+export async function writeServerNote(
+  auth: SyncAuth,
+  note: NoteDetail,
+): Promise<WriteOutcome> {
+  return runOp<WriteOutcome>('writeServerNote', { ...auth, note });
+}
+
+/** Update a local note to match the server copy ("accept server"). */
+export async function acceptServerNote(
+  nid: number,
+  server: NoteDetail,
+): Promise<{ saved: boolean }> {
+  return runOp<{ saved: boolean }>('acceptServerNote', { nid, server });
+}
+
+/** Assign a fresh GUID to a local note that has none. */
+export async function generateNoteGuid(nid: number): Promise<{ guid: string }> {
+  return runOp<{ guid: string }>('generateNoteGuid', { nid });
+}
+
+/** A per-deck diff classification used by the compare view. */
+export type DeckDiff =
+  | { status: 'in-sync'; deck: DeckManifest }
+  | { status: 'local-newer'; deck: DeckManifest; server?: DeckManifest }
+  | { status: 'server-newer'; deck: DeckManifest; local?: DeckManifest }
+  | { status: 'server-only'; deck: DeckManifest }
+  | { status: 'local-only'; deck: DeckManifest }
+  | { status: 'conflict'; deck: DeckManifest; server: DeckManifest };
+
+export type NoteDiffStatus =
+  | 'in-sync'
+  | 'conflict'
+  | 'card-count'
+  | 'local-newer'
+  | 'server-newer'
+  | 'local-only'
+  | 'server-only'
+  | 'local-extra'
+  | 'server-extra';
+
+export type NoteDiff = {
+  guid: string;
+  preview: string;
+  status: NoteDiffStatus;
+  local?: NoteManifest;
+  server?: NoteManifest;
+};
+
+/** Diff two manifests deck-by-deck (keyed by name, since ids differ across
+ *  collections). Returns one entry per deck that exists on either side. */
+export function diffManifests(local: Manifest, server: Manifest): DeckDiff[] {
+  const localByName = new Map(local.decks.map(d => [d.name, d]));
+  const serverByName = new Map(server.decks.map(d => [d.name, d]));
+  const allNames = new Set([...localByName.keys(), ...serverByName.keys()]);
+  const diffs: DeckDiff[] = [];
+  for (const name of allNames) {
+    const l = localByName.get(name);
+    const s = serverByName.get(name);
+    if (l && s) {
+      if (l.hash === s.hash) {
+        diffs.push({ status: 'in-sync', deck: l });
+      } else if (l.mod > s.mod) {
+        diffs.push({ status: 'local-newer', deck: l, server: s });
+      } else if (s.mod > l.mod) {
+        diffs.push({ status: 'server-newer', deck: s, local: l });
+      } else {
+        diffs.push({ status: 'conflict', deck: l, server: s });
+      }
+    } else if (s) {
+      diffs.push({ status: 'server-only', deck: s });
+    } else if (l) {
+      diffs.push({ status: 'local-only', deck: l });
+    }
+  }
+  return diffs.sort((a, b) => a.deck.name.localeCompare(b.deck.name));
+}
+
+function cardCountInDeck(note: NoteManifest | undefined, deckId: number): number {
+  if (!note) return 0;
+  const decks = note.decks ?? [];
+  const counts = note.cards_per_deck ?? [];
+  return decks.reduce((total, did, i) => total + (did === deckId ? (counts[i] ?? 0) : 0), 0);
+}
+
+function groupNotesByGuid(notes: NoteManifest[], deckId: number): Map<string, NoteManifest[]> {
+  const out = new Map<string, NoteManifest[]>();
+  for (const note of notes) {
+    if (!(note.decks ?? []).includes(deckId)) continue;
+    const arr = out.get(note.guid) ?? [];
+    arr.push(note);
+    out.set(note.guid, arr);
+  }
+  return out;
+}
+
+function noteStatus(local: NoteManifest | undefined, server: NoteManifest | undefined, localDeckId: number, serverDeckId: number): NoteDiffStatus {
+  if (local && server) {
+    const fieldsMatch = local.hash === server.hash && local.mod === server.mod;
+    if (fieldsMatch) {
+      return cardCountInDeck(local, localDeckId) !== cardCountInDeck(server, serverDeckId)
+        ? 'card-count'
+        : 'in-sync';
+    }
+    if (local.mod > server.mod) return 'local-newer';
+    if (server.mod > local.mod) return 'server-newer';
+    return 'conflict';
+  }
+  return local ? 'local-only' : 'server-only';
+}
+
+export function diffDeckNotes(local: Manifest, server: Manifest, deckDiff: DeckDiff): NoteDiff[] {
+  const localDeck = 'local' in deckDiff && deckDiff.local ? deckDiff.local : deckDiff.deck;
+  const serverDeck = 'server' in deckDiff && deckDiff.server ? deckDiff.server : deckDiff.status === 'server-only' ? deckDiff.deck : undefined;
+  if (!localDeck || !serverDeck) return [];
+
+  const localByGuid = groupNotesByGuid(local.notes ?? [], localDeck.id);
+  const serverByGuid = groupNotesByGuid(server.notes ?? [], serverDeck.id);
+  const allGuids = new Set([...localByGuid.keys(), ...serverByGuid.keys()]);
+  const out: NoteDiff[] = [];
+
+  const append = (guid: string, localNote?: NoteManifest, serverNote?: NoteManifest, statusOverride?: NoteDiffStatus) => {
+    const note = localNote ?? serverNote;
+    out.push({
+      guid,
+      preview: note?.preview || '(no preview)',
+      status: statusOverride ?? noteStatus(localNote, serverNote, localDeck.id, serverDeck.id),
+      local: localNote,
+      server: serverNote,
+    });
+  };
+
+  for (const guid of allGuids) {
+    const locals = [...(localByGuid.get(guid) ?? [])].sort((a, b) => (a.nid ?? 0) - (b.nid ?? 0));
+    const servers = [...(serverByGuid.get(guid) ?? [])].sort((a, b) => (a.nid ?? 0) - (b.nid ?? 0));
+    const hadLocal = locals.length > 0;
+    const hadServer = servers.length > 0;
+
+    while (locals.length && servers.length) {
+      const localNote = locals.shift()!;
+      const matchIdx = servers.findIndex(s => s.hash === localNote.hash && s.mod === localNote.mod);
+      const serverNote = servers.splice(matchIdx >= 0 ? matchIdx : 0, 1)[0];
+      append(guid, localNote, serverNote);
+    }
+    for (const localNote of locals) append(guid, localNote, undefined, hadServer ? 'local-extra' : 'local-only');
+    for (const serverNote of servers) append(guid, undefined, serverNote, hadLocal ? 'server-extra' : 'server-only');
+  }
+
+  const priority: Record<NoteDiffStatus, number> = {
+    conflict: 0,
+    'card-count': 0,
+    'local-newer': 1,
+    'server-newer': 1,
+    'local-extra': 2,
+    'server-extra': 2,
+    'local-only': 2,
+    'server-only': 2,
+    'in-sync': 3,
+  };
+  return out.sort((a, b) => priority[a.status] - priority[b.status] || a.preview.localeCompare(b.preview) || a.guid.localeCompare(b.guid));
+}
+
 /** Run a full incremental sync (collection + media) using stored credentials,
  * for the home-screen Sync button. Handles the full-sync case the server may
  * demand. Returns a one-line status string for the UI. */
