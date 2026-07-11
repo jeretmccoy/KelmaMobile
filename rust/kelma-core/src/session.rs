@@ -1611,6 +1611,15 @@ impl KelmaSession {
             .col
             .as_mut()
             .ok_or_else(|| "collection is not open".to_string())?;
+        // The local collection's creation day. Anki review `due` values are days
+        // since this crt, so scheduling written by a collection with a
+        // different crt must be shifted to this collection's day scale.
+        let local_crt: i64 = col
+            .storage
+            .db()
+            .query_row("SELECT crt FROM col", [], |r| r.get(0))
+            .unwrap_or(0);
+        let local_crt_day = local_crt / 86400;
         let mut created_decks = 0usize;
         for deck in &pulled_decks {
             let name = deck.get("name").and_then(Value::as_str).unwrap_or("Default");
@@ -1722,22 +1731,147 @@ impl KelmaSession {
             let sched = card.get("scheduling").and_then(Value::as_object);
             let s_i64 = |key: &str| -> i64 { sched.and_then(|m| m.get(key)).and_then(Value::as_i64).unwrap_or(0) };
             let s_str = |key: &str| -> String { sched.and_then(|m| m.get(key)).and_then(Value::as_str).unwrap_or("").to_string() };
+            let queue = s_i64("queue");
+            // Shift day-based due values from the writer's collection day scale
+            // to ours. Review (2) and day-learning (3) store `due` in days since
+            // the writing collection's crt; other queues are date/position
+            // values that are already collection-independent.
+            let writer_crt_day = card
+                .get("scheduling")
+                .and_then(|s| s.get("_crt"))
+                .and_then(Value::as_i64)
+                .map(|c| c / 86400)
+                .unwrap_or(local_crt_day);
+            let day_shift = writer_crt_day - local_crt_day;
+            let due = if queue == 2 || queue == 3 { s_i64("due") + day_shift } else { s_i64("due") };
+            let odue = if s_i64("odid") != 0 && (queue == 2 || queue == 3) {
+                s_i64("odue") + day_shift
+            } else {
+                s_i64("odue")
+            };
             col.storage.db().execute(
                 "UPDATE cards SET did=?, type=?, queue=?, due=?, ivl=?, factor=?, reps=?, lapses=?, left=?, odue=?, odid=?, flags=?, data=?, usn=0 WHERE id=?",
                 rusqlite::params![
-                    did.0, s_i64("type"), s_i64("queue"), s_i64("due"), s_i64("ivl"),
+                    did.0, s_i64("type"), queue, due, s_i64("ivl"),
                     s_i64("factor"), s_i64("reps"), s_i64("lapses"), s_i64("left"),
-                    s_i64("odue"), s_i64("odid"), s_i64("flags"), s_str("data"), cid
+                    odue, s_i64("odid"), s_i64("flags"), s_str("data"), cid
                 ],
             )
             .map_err(|e| format!("apply card {guid}:{ord}: {e}"))?;
             applied_cards += 1;
         }
 
+        // --- Upload local changes (usn = -1 marks rows changed since last sync,
+        // e.g. a card answered during review, or a note edited on device). ---
+        let now_secs = TimestampSecs::now().0;
+
+        // Pending notes -> push as v2 note records.
+        let pending_notes: Vec<(String, i64, i64, String, String)> = {
+            let db = col.storage.db();
+            let mut stmt = db
+                .prepare("SELECT guid, mid, mod, flds, tags FROM notes WHERE usn = -1 AND guid <> ''")
+                .map_err(|e| format!("query pending notes: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|e| format!("map pending notes: {e}"))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let mut note_payloads = Vec::<Value>::new();
+        for (guid, mid, nmod, flds, tags) in &pending_notes {
+            note_payloads.push(json!({
+                "guid": guid,
+                "notetype_id": mid,
+                "fields": flds.split('\u{1f}').collect::<Vec<_>>(),
+                "tags": tags.split_whitespace().collect::<Vec<_>>(),
+                "client_modified_at": rfc3339_from_secs(*nmod),
+                "base_checksum": "",
+            }));
+        }
+
+        // Pending cards -> push scheduling by logical (note_guid, ord) identity,
+        // tagging each with our crt so other collections can convert `due`.
+        let pending_cards: Vec<(i64, String, i64, String, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, String)> = {
+            let db = col.storage.db();
+            let mut stmt = db
+                .prepare(
+                    "SELECT c.id, n.guid, c.ord, d.name, c.mod, c.type, c.queue, c.due, c.ivl, c.factor, \
+                            c.reps, c.lapses, c.left, c.odue, c.odid, c.data \
+                     FROM cards c JOIN notes n ON n.id = c.nid JOIN decks d ON d.id = c.did \
+                     WHERE c.usn = -1 AND n.guid <> ''",
+                )
+                .map_err(|e| format!("query pending cards: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?, r.get::<_, i64>(7)?, r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?, r.get::<_, i64>(10)?, r.get::<_, i64>(11)?,
+                        r.get::<_, i64>(12)?, r.get::<_, i64>(13)?, r.get::<_, i64>(14)?,
+                        r.get::<_, String>(15)?,
+                    ))
+                })
+                .map_err(|e| format!("map pending cards: {e}"))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let mut card_payloads = Vec::<Value>::new();
+        for c in &pending_cards {
+            let (cid, guid, ord, deck, cmod, ctype, queue, due, ivl, factor, reps, lapses, left, odue, odid, data) =
+                c;
+            card_payloads.push(json!({
+                "card_id": cid,
+                "note_guid": guid,
+                "deck_name": deck,
+                "ord": ord,
+                "scheduling": {
+                    "type": ctype, "queue": queue, "due": due, "ivl": ivl, "factor": factor,
+                    "reps": reps, "lapses": lapses, "left": left, "odue": odue, "odid": odid,
+                    "flags": 0, "data": data, "_crt": local_crt,
+                },
+                "client_modified_at": rfc3339_from_secs(*cmod),
+            }));
+        }
+
+        let mut pushed_notes = 0usize;
+        let mut pushed_cards = 0usize;
+        if !note_payloads.is_empty() || !card_payloads.is_empty() {
+            for nchunk in note_payloads.chunks(500) {
+                let resp = v2_json("POST", endpoint, "/v2/batch/push", Some(token), Some(json!({
+                    "notes": nchunk, "cards": [], "notetypes": [], "decks": []
+                })))?;
+                pushed_notes += resp.get("accepted").and_then(|a| a.get("notes")).and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            for cchunk in card_payloads.chunks(500) {
+                let resp = v2_json("POST", endpoint, "/v2/batch/push", Some(token), Some(json!({
+                    "notes": [], "cards": cchunk, "notetypes": [], "decks": []
+                })))?;
+                pushed_cards += resp.get("accepted").and_then(|a| a.get("cards")).and_then(Value::as_u64).unwrap_or(0) as usize;
+            }
+            // Mark uploaded rows as synced so we don't resend them next time.
+            let db = col.storage.db();
+            db.execute("UPDATE notes SET usn = 0 WHERE usn = -1 AND guid <> ''", [])
+                .map_err(|e| format!("clear note usn: {e}"))?;
+            db.execute(
+                "UPDATE cards SET usn = 0 WHERE usn = -1 AND nid IN (SELECT id FROM notes WHERE guid <> '')",
+                [],
+            )
+            .map_err(|e| format!("clear card usn: {e}"))?;
+        }
+        let _ = now_secs;
+
         Ok(V2SyncOutcome {
-            changed: added_notes > 0 || applied_cards > 0 || applied_notetypes > 0 || created_decks > 0,
+            changed: added_notes > 0 || applied_cards > 0 || applied_notetypes > 0
+                || created_decks > 0 || pushed_notes > 0 || pushed_cards > 0,
             message: format!(
-                "v2 sync: {created_decks} deck(s), {applied_notetypes} notetype(s), {added_notes} note(s), {applied_cards} card(s) applied"
+                "v2 sync: pulled {created_decks} deck(s), {applied_notetypes} notetype(s), {added_notes} note(s), {applied_cards} card(s); pushed {pushed_notes} note(s), {pushed_cards} card(s)"
             ),
         })
     }
@@ -2196,6 +2330,30 @@ fn v2_json(
             serde_json::from_str(&text).map_err(|e| format!("v2 JSON {path}: {e}: {text}"))
         }
     })
+}
+
+/// Format a unix-seconds timestamp as an RFC3339 UTC string, matching the
+/// `client_modified_at` shape the v2 server parses (`time.Time` JSON).
+fn rfc3339_from_secs(secs: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    // Minimal RFC3339 formatter without pulling in chrono at this layer.
+    let secs = secs.max(0) as u64;
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Civil-from-days (Howard Hinnant's algorithm), epoch 1970-01-01.
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let _ = UNIX_EPOCH + Duration::from_secs(secs);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 fn v2_bytes(endpoint: &str, path: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
