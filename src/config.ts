@@ -4,15 +4,14 @@
  */
 
 /**
- * The default sync server. Kelma ships pointed at KelmaSync, the self-hosted,
- * Anki-wire-compatible sync server. Anki clients append `/sync/*` and
- * `/msync/*` to this base URL, so it must be the gateway root.
+ * The default KelmaSync v2 REST server. Native clients append `/v2/*` routes
+ * to this base URL.
  *
- * Points at the public KelmaSync deployment, reachable from any network
- * (served through Cloudflare → cloudflared tunnel → gateway on bev). Override
+ * Points at the public KelmaSync v2 deployment, reachable from any network
+ * (served through Cloudflare → cloudflared tunnel → Go server on bev). Override
  * per-user once a settings screen exists.
  */
-export const DEFAULT_SYNC_ENDPOINT = 'https://sync.kelma.tech';
+export const DEFAULT_SYNC_ENDPOINT = 'https://sync2.ankiai.tech';
 
 
 /**
