@@ -47,9 +47,11 @@ beforeEach(() => {
 describe('collection lifecycle', () => {
   it('opens the default profile by id (native resolves the path)', async () => {
     await openProfile();
-    expect(native.openCollection).toHaveBeenCalledWith(
-      JSON.stringify({ profileId: 'default' }),
-    );
+    expect(native.openCollection).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(native.openCollection.mock.calls[0][0])).toEqual({
+      profileId: 'default',
+      timeZone: expect.any(String),
+    });
   });
 });
 
