@@ -1946,9 +1946,17 @@ impl KelmaSession {
             if path.exists() {
                 continue;
             }
-            let bytes = v2_bytes(&endpoint, &format!("/v2/media/{}", urlencode(&filename)), Some(&token))?;
-            std::fs::write(&path, bytes).map_err(|e| format!("write media {filename}: {e}"))?;
-            downloaded += 1;
+            match v2_bytes(&endpoint, &format!("/v2/media/{}", urlencode(&filename)), Some(&token)) {
+                Ok(bytes) => {
+                    std::fs::write(&path, bytes).map_err(|e| format!("write media {filename}: {e}"))?;
+                    downloaded += 1;
+                }
+                // The server lists the file but can't serve its bytes yet
+                // (e.g. another device hasn't re-uploaded after a dev reset).
+                // Skip instead of failing the whole media sync.
+                Err(e) if e.contains("(404") => continue,
+                Err(e) => return Err(e),
+            }
         }
         let (files, bytes) = media_folder_totals(&media_folder)?;
         Ok(json!({ "files": files, "bytes": bytes, "downloaded": downloaded }))
