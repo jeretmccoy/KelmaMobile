@@ -584,6 +584,13 @@ export async function getPendingChanges(): Promise<PendingChanges> {
  * store), or `null` if the user hasn't signed in. */
 export async function getStoredSyncAuth(): Promise<SyncAuth | null> {
   const result = await runOp<SyncAuth | null>('getSyncAuth');
+  if (result && result.endpoint.replace(/\/$/, '') !== DEFAULT_SYNC_ENDPOINT) {
+    // Tokens are scoped to their issuing server. Invalidate credentials saved
+    // by the localhost/v1 deployment so upgrading users sign in once against
+    // the production v2 endpoint instead of repeatedly failing with a 401.
+    await clearStoredSyncAuth();
+    return null;
+  }
   return result ?? null;
 }
 
