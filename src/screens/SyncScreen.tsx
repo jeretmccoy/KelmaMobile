@@ -247,8 +247,8 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
         const detail = `↓ ${p.downloadedFiles.toLocaleString()} · ↑ ${p.uploadedFiles.toLocaleString()} · ${p.checked.toLocaleString()} checked`;
         updateStep('media', 'running', detail);
         setStatus(`Syncing media… ${moved.toLocaleString()} files transferred`);
-        // Log a milestone every 200 files so the log stays useful, not spammy.
-        if (moved - lastLoggedFiles >= 200) {
+        // Match desktop: log a milestone every 100 transferred files.
+        if (moved - lastLoggedFiles >= 100) {
           lastLoggedFiles = moved;
           pushLog(`Media: ↓${p.downloadedFiles.toLocaleString()} ↑${p.uploadedFiles.toLocaleString()} transferred…`);
         }

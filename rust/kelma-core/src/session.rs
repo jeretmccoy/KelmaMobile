@@ -13,10 +13,11 @@ use std::thread;
 use anki::browser_table::Column;
 use anki::card::CardId;
 use anki::collection::{Collection, CollectionBuilder};
-use anki::progress::{Progress, ProgressState};
 use anki::decks::{Deck, DeckId, DeckKind, NativeDeckName};
+use anki::import_export::package::ExportAnkiPackageOptions;
 use anki::notetype::NotetypeId;
 use anki::prelude::{AnkiError, OrInvalid, OrNotFound};
+use anki::progress::{Progress, ProgressState};
 use anki::scheduler::answering::{CardAnswer, Rating};
 use anki::scheduler::states::SchedulingStates;
 use anki::search::{parse_search, JoinSearches, SearchBuilder, SearchNode, SortMode, StateKind};
@@ -26,7 +27,6 @@ use anki::timestamp::{TimestampMillis, TimestampSecs};
 use anki::types::Usn;
 use anki_proto::decks::DeckTreeNode;
 use anki_proto::generic::StringList;
-use anki::import_export::package::ExportAnkiPackageOptions;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
@@ -39,7 +39,7 @@ pub struct KelmaSession {
     /// Live progress cell of an in-flight background media sync (see
     /// `sync_media_start`). Read by `sync_media_poll` without the `inner` lock,
     /// so progress can be polled while the sync runs on its own thread.
-    media_progress: Mutex<Option<Arc<Mutex<ProgressState>>>>,
+    media_progress: Mutex<Option<Arc<Mutex<V2MediaProgress>>>>,
     /// Set by the media-sync worker thread when it finishes: `Ok(totals)` or
     /// `Err(message)`. `None` inside means still running.
     media_done: Mutex<Option<Arc<Mutex<Option<Result<Value, String>>>>>>,
@@ -57,6 +57,12 @@ struct SessionState {
     collection_path: String,
     media_folder_path: String,
     media_db_path: String,
+}
+
+#[derive(Default)]
+struct V2MediaProgress {
+    checked: usize,
+    downloaded_files: usize,
 }
 
 /// Build the reqwest client rslib expects for sync. It must be the same
@@ -139,7 +145,10 @@ impl KelmaSession {
         &self,
         f: impl FnOnce(&mut Collection) -> Result<T, AnkiError>,
     ) -> Result<T, String> {
-        let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
         let col = guard
             .col
             .as_mut()
@@ -149,14 +158,18 @@ impl KelmaSession {
 
     /// Full deck tree with today's study counts, as nested JSON.
     pub fn deck_tree(&self) -> Result<Value, String> {
-        let node = self.with_col(|col| col.deck_tree(Some(anki::timestamp::TimestampSecs::now())))?;
+        let node =
+            self.with_col(|col| col.deck_tree(Some(anki::timestamp::TimestampSecs::now())))?;
         Ok(deck_node_to_json(&node))
     }
 
     /// Absolute path of the collection's media folder, so the platform layer
     /// can resolve `[sound:resource]` tags to on-disk files for playback.
     pub fn media_dir(&self) -> Result<Value, String> {
-        let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
         Ok(json!({ "dir": guard.media_folder_path }))
     }
 
@@ -172,7 +185,10 @@ impl KelmaSession {
     /// granted root to be an ancestor of the file actually being loaded.
     pub fn write_card_html(&self, request: &Value) -> Result<Value, String> {
         let html = str_field(request, "html")?;
-        let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
         let media_path = std::path::Path::new(&guard.media_folder_path);
         let profile_dir = media_path
             .parent()
@@ -181,7 +197,8 @@ impl KelmaSession {
         // A fresh filename per render: WKWebView can otherwise keep serving a
         // cached copy of a `file://` URL it already loaded even after the
         // underlying file changes on disk.
-        let scratch_path = profile_dir.join(format!("kelma_card_{}.html", TimestampMillis::now().0));
+        let scratch_path =
+            profile_dir.join(format!("kelma_card_{}.html", TimestampMillis::now().0));
         std::fs::write(&scratch_path, html.as_bytes())
             .map_err(|e| format!("writing scratch card html: {e}"))?;
 
@@ -367,10 +384,7 @@ impl KelmaSession {
             // `deck:"Name"` matches the deck and all of its subdecks, exactly how
             // AnkiDroid scopes per-deck statistics.
             let search = format!("deck:\"{}\"", name.replace('"', "\\\""));
-            let g = col.graphs(GraphsRequest {
-                search,
-                days,
-            })?;
+            let g = col.graphs(GraphsRequest { search, days })?;
             Ok(graphs_to_json(&name, days, &g))
         })
     }
@@ -383,9 +397,7 @@ impl KelmaSession {
     pub fn deck_overview(&self, request: &Value) -> Result<Value, String> {
         let deck_id = DeckId(i64_field(request, "deckId")?);
         self.with_col(|col| {
-            let deck = col
-                .get_deck(deck_id)?
-                .or_not_found(deck_id)?;
+            let deck = col.get_deck(deck_id)?.or_not_found(deck_id)?;
             let name = deck.name.human_name();
             let filtered = matches!(deck.kind, DeckKind::Filtered(_));
             let description = match &deck.kind {
@@ -408,8 +420,8 @@ impl KelmaSession {
             };
 
             // Total new cards across this deck and its subdecks.
-            let new_search = SearchBuilder::from(SearchNode::from_deck_id(deck_id, true))
-                .and(StateKind::New);
+            let new_search =
+                SearchBuilder::from(SearchNode::from_deck_id(deck_id, true)).and(StateKind::New);
             let total_new = col.search_cards(new_search, SortMode::NoOrder)?.len() as i64;
 
             Ok(json!({
@@ -757,9 +769,7 @@ impl KelmaSession {
             })
             .unwrap_or_default();
         self.with_col(|col| {
-            let nt = col
-                .get_notetype(notetype_id)?
-                .or_invalid("note type")?;
+            let nt = col.get_notetype(notetype_id)?.or_invalid("note type")?;
             let mut note = nt.new_note();
             for (idx, value) in fields.iter().enumerate() {
                 // `set_field` errors on out-of-range indices; pad defensively
@@ -791,9 +801,7 @@ impl KelmaSession {
             .map(|v| v.as_str().unwrap_or("").to_owned())
             .collect::<Vec<_>>();
         self.with_col(|col| {
-            let nt = col
-                .get_notetype(notetype_id)?
-                .or_invalid("note type")?;
+            let nt = col.get_notetype(notetype_id)?.or_invalid("note type")?;
             let mut note = nt.new_note();
             for (idx, value) in fields.iter().enumerate() {
                 if idx < note.fields().len() {
@@ -951,7 +959,8 @@ impl KelmaSession {
             // only — the plugin deliberately does not roll children into parents
             // so each row's badge reflects just that deck).
             let mut decks: Vec<Value> = Vec::new();
-            let dids: std::collections::BTreeSet<i64> = added.keys().chain(changed.keys()).copied().collect();
+            let dids: std::collections::BTreeSet<i64> =
+                added.keys().chain(changed.keys()).copied().collect();
             for did in dids {
                 let a = added.get(&did).copied().unwrap_or(0);
                 let c = changed.get(&did).copied().unwrap_or(0);
@@ -1029,13 +1038,11 @@ impl KelmaSession {
     pub fn sync_debug(&self) -> Result<Value, String> {
         self.with_col(|col| {
             let db = col.storage.db();
-            let (mod_, scm, ls, usn): (i64, i64, i64, i64) = db
-                .query_row("select mod, scm, ls, usn from col", [], |row| {
+            let (mod_, scm, ls, usn): (i64, i64, i64, i64) =
+                db.query_row("select mod, scm, ls, usn from col", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?;
-            let count = |sql: &str| -> i64 {
-                db.query_row(sql, [], |row| row.get(0)).unwrap_or(0)
-            };
+            let count = |sql: &str| -> i64 { db.query_row(sql, [], |row| row.get(0)).unwrap_or(0) };
             Ok(json!({
                 "col": { "mod": mod_, "scm": scm, "ls": ls, "usn": usn },
                 "pendingCards": count("select count(*) from cards where usn=-1"),
@@ -1082,9 +1089,8 @@ impl KelmaSession {
             // Schema 15+ stores decks in a normalized table. Fall back to the
             // legacy col.decks JSON for old collections.
             if let Ok(mut stmt) = db.prepare("SELECT id, name FROM decks") {
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                })?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
                 for row in rows {
                     let (id, name) = row?;
                     deck_names.insert(id, name);
@@ -1109,9 +1115,8 @@ impl KelmaSession {
             let mut card_counts: HashMap<i64, i64> = HashMap::new();
             {
                 let mut stmt = db.prepare("SELECT did, COUNT(*) FROM cards GROUP BY did")?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                })?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
                     let (did, cnt) = row?;
                     card_counts.insert(did, cnt);
@@ -1166,7 +1171,11 @@ impl KelmaSession {
                      GROUP BY n.id, c.did",
                 )?;
                 let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?;
                 for row in rows {
                     let (nid, did, cnt) = row?;
@@ -1221,7 +1230,8 @@ impl KelmaSession {
             // Full notes list (the drill-in diff data).
             let mut notes: Vec<Value> = Vec::new();
             {
-                let mut stmt = db.prepare("SELECT id, guid, mid, mod, flds FROM notes ORDER BY guid")?;
+                let mut stmt =
+                    db.prepare("SELECT id, guid, mid, mod, flds FROM notes ORDER BY guid")?;
                 let rows = stmt.query_map([], |r| {
                     let nid: i64 = r.get(0)?;
                     let guid: String = r.get(1)?;
@@ -1329,14 +1339,32 @@ impl KelmaSession {
                 db.query_row(
                     "SELECT id, guid, mid, mod, flds, tags FROM notes WHERE id = ?",
                     [nid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?
             } else {
                 db.query_row(
                     "SELECT id, guid, mid, mod, flds, tags FROM notes WHERE guid = ?",
                     [guid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?
             };
@@ -1579,34 +1607,81 @@ impl KelmaSession {
 
         let mut pulled_notes = Vec::<Value>::new();
         for chunk in server_note_guids.chunks(500) {
-            let resp = v2_json("POST", endpoint, "/v2/batch/pull", Some(token), Some(json!({
-                "notes": chunk, "cards": [], "notetypes": [], "decks": []
-            })))?;
-            pulled_notes.extend(resp.get("notes").and_then(Value::as_array).cloned().unwrap_or_default());
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/pull",
+                Some(token),
+                Some(json!({
+                    "notes": chunk, "cards": [], "notetypes": [], "decks": []
+                })),
+            )?;
+            pulled_notes.extend(
+                resp.get("notes")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
         let mut pulled_cards = Vec::<Value>::new();
         for chunk in server_card_ids.chunks(500) {
-            let resp = v2_json("POST", endpoint, "/v2/batch/pull", Some(token), Some(json!({
-                "notes": [], "cards": chunk, "notetypes": [], "decks": []
-            })))?;
-            pulled_cards.extend(resp.get("cards").and_then(Value::as_array).cloned().unwrap_or_default());
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/pull",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": chunk, "notetypes": [], "decks": []
+                })),
+            )?;
+            pulled_cards.extend(
+                resp.get("cards")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
         let mut pulled_notetypes = Vec::<Value>::new();
         for chunk in server_notetype_ids.chunks(200) {
-            let resp = v2_json("POST", endpoint, "/v2/batch/pull", Some(token), Some(json!({
-                "notes": [], "cards": [], "notetypes": chunk, "decks": []
-            })))?;
-            pulled_notetypes.extend(resp.get("notetypes").and_then(Value::as_array).cloned().unwrap_or_default());
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/pull",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": [], "notetypes": chunk, "decks": []
+                })),
+            )?;
+            pulled_notetypes.extend(
+                resp.get("notetypes")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
         let mut pulled_decks = Vec::<Value>::new();
         for chunk in server_deck_names.chunks(200) {
-            let resp = v2_json("POST", endpoint, "/v2/batch/pull", Some(token), Some(json!({
-                "notes": [], "cards": [], "notetypes": [], "decks": chunk
-            })))?;
-            pulled_decks.extend(resp.get("decks").and_then(Value::as_array).cloned().unwrap_or_default());
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/pull",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": [], "notetypes": [], "decks": chunk
+                })),
+            )?;
+            pulled_decks.extend(
+                resp.get("decks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
 
-        let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
         let col = guard
             .col
             .as_mut()
@@ -1622,7 +1697,10 @@ impl KelmaSession {
         let local_crt_day = local_crt / 86400;
         let mut created_decks = 0usize;
         for deck in &pulled_decks {
-            let name = deck.get("name").and_then(Value::as_str).unwrap_or("Default");
+            let name = deck
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Default");
             if ensure_deck(col, name)? {
                 created_decks += 1;
             }
@@ -1631,7 +1709,12 @@ impl KelmaSession {
         let mut applied_notetypes = 0usize;
         for nt in &pulled_notetypes {
             let ntid = nt.get("notetype_id").and_then(Value::as_i64).unwrap_or(0);
-            if ntid == 0 || col.get_notetype(NotetypeId(ntid)).map_err(|e| format!("{e:?}"))?.is_some() {
+            if ntid == 0
+                || col
+                    .get_notetype(NotetypeId(ntid))
+                    .map_err(|e| format!("{e:?}"))?
+                    .is_some()
+            {
                 continue;
             }
             let mut definition = nt.get("definition").cloned().unwrap_or_else(|| json!({}));
@@ -1643,13 +1726,15 @@ impl KelmaSession {
                 obj.entry("mod".to_string()).or_insert(json!(0));
                 obj.entry("usn".to_string()).or_insert(json!(0));
             }
-            let json_bytes = serde_json::to_vec(&definition).map_err(|e| format!("notetype json: {e}"))?;
-            let _ = col.add_or_update_notetype(anki_proto::notetypes::AddOrUpdateNotetypeRequest {
-                json: json_bytes,
-                skip_checks: true,
-                preserve_usn_and_mtime: true,
-            })
-            .map_err(|e| format!("apply notetype {ntid}: {e:?}"))?;
+            let json_bytes =
+                serde_json::to_vec(&definition).map_err(|e| format!("notetype json: {e}"))?;
+            let _ = col
+                .add_or_update_notetype(anki_proto::notetypes::AddOrUpdateNotetypeRequest {
+                    json: json_bytes,
+                    skip_checks: true,
+                    preserve_usn_and_mtime: true,
+                })
+                .map_err(|e| format!("apply notetype {ntid}: {e:?}"))?;
             applied_notetypes += 1;
         }
 
@@ -1661,7 +1746,9 @@ impl KelmaSession {
                 card.get("note_guid").and_then(Value::as_str),
                 card.get("deck_name").and_then(Value::as_str),
             ) {
-                note_deck.entry(guid.to_string()).or_insert_with(|| deck.to_string());
+                note_deck
+                    .entry(guid.to_string())
+                    .or_insert_with(|| deck.to_string());
             }
         }
 
@@ -1671,7 +1758,9 @@ impl KelmaSession {
             if guid.is_empty() {
                 continue;
             }
-            let exists: Option<i64> = col.storage.db()
+            let exists: Option<i64> = col
+                .storage
+                .db()
                 .query_row("SELECT id FROM notes WHERE guid = ?", [guid], |r| r.get(0))
                 .optional()
                 .map_err(|e| format!("check note {guid}: {e}"))?;
@@ -1687,10 +1776,15 @@ impl KelmaSession {
             ensure_deck(col, deck_name)?;
             let did = deck_id_by_name(col, deck_name)?.unwrap_or(DeckId(1));
             let mut local = nt.new_note();
-            let fields = note.get("fields").and_then(Value::as_array).cloned().unwrap_or_default();
+            let fields = note
+                .get("fields")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             for (idx, field) in fields.iter().enumerate() {
                 if idx < local.fields().len() {
-                    local.set_field(idx, field.as_str().unwrap_or("").to_string())
+                    local
+                        .set_field(idx, field.as_str().unwrap_or("").to_string())
                         .map_err(|e| format!("set note field {guid}: {e:?}"))?;
                 }
             }
@@ -1704,7 +1798,12 @@ impl KelmaSession {
                 .collect();
             col.add_note(&mut local, did)
                 .map_err(|e| format!("add note {guid}: {e:?}"))?;
-            col.storage.db().execute("UPDATE notes SET guid = ?, usn = 0 WHERE id = ?", (&guid, local.id.0))
+            col.storage
+                .db()
+                .execute(
+                    "UPDATE notes SET guid = ?, usn = 0 WHERE id = ?",
+                    (&guid, local.id.0),
+                )
                 .map_err(|e| format!("stamp guid {guid}: {e}"))?;
             added_notes += 1;
         }
@@ -1725,12 +1824,26 @@ impl KelmaSession {
                 .optional()
                 .map_err(|e| format!("find local card {guid}:{ord}: {e}"))?;
             let Some(cid) = cid else { continue };
-            let deck_name = card.get("deck_name").and_then(Value::as_str).unwrap_or("Default");
+            let deck_name = card
+                .get("deck_name")
+                .and_then(Value::as_str)
+                .unwrap_or("Default");
             ensure_deck(col, deck_name)?;
             let did = deck_id_by_name(col, deck_name)?.unwrap_or(DeckId(1));
             let sched = card.get("scheduling").and_then(Value::as_object);
-            let s_i64 = |key: &str| -> i64 { sched.and_then(|m| m.get(key)).and_then(Value::as_i64).unwrap_or(0) };
-            let s_str = |key: &str| -> String { sched.and_then(|m| m.get(key)).and_then(Value::as_str).unwrap_or("").to_string() };
+            let s_i64 = |key: &str| -> i64 {
+                sched
+                    .and_then(|m| m.get(key))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
+            let s_str = |key: &str| -> String {
+                sched
+                    .and_then(|m| m.get(key))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
             let queue = s_i64("queue");
             // Shift day-based due values from the writer's collection day scale
             // to ours. Review (2) and day-learning (3) store `due` in days since
@@ -1743,7 +1856,11 @@ impl KelmaSession {
                 .map(|c| c / 86400)
                 .unwrap_or(local_crt_day);
             let day_shift = writer_crt_day - local_crt_day;
-            let due = if queue == 2 || queue == 3 { s_i64("due") + day_shift } else { s_i64("due") };
+            let due = if queue == 2 || queue == 3 {
+                s_i64("due") + day_shift
+            } else {
+                s_i64("due")
+            };
             let odue = if s_i64("odid") != 0 && (queue == 2 || queue == 3) {
                 s_i64("odue") + day_shift
             } else {
@@ -1769,7 +1886,9 @@ impl KelmaSession {
         let pending_notes: Vec<(String, i64, i64, String, String)> = {
             let db = col.storage.db();
             let mut stmt = db
-                .prepare("SELECT guid, mid, mod, flds, tags FROM notes WHERE usn = -1 AND guid <> ''")
+                .prepare(
+                    "SELECT guid, mid, mod, flds, tags FROM notes WHERE usn = -1 AND guid <> ''",
+                )
                 .map_err(|e| format!("query pending notes: {e}"))?;
             let rows = stmt
                 .query_map([], |r| {
@@ -1798,7 +1917,24 @@ impl KelmaSession {
 
         // Pending cards -> push scheduling by logical (note_guid, ord) identity,
         // tagging each with our crt so other collections can convert `due`.
-        let pending_cards: Vec<(i64, String, i64, String, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, String)> = {
+        let pending_cards: Vec<(
+            i64,
+            String,
+            i64,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+        )> = {
             let db = col.storage.db();
             let mut stmt = db
                 .prepare(
@@ -1811,11 +1947,21 @@ impl KelmaSession {
             let rows = stmt
                 .query_map([], |r| {
                     Ok((
-                        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?, r.get::<_, i64>(7)?, r.get::<_, i64>(8)?,
-                        r.get::<_, i64>(9)?, r.get::<_, i64>(10)?, r.get::<_, i64>(11)?,
-                        r.get::<_, i64>(12)?, r.get::<_, i64>(13)?, r.get::<_, i64>(14)?,
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
+                        r.get::<_, i64>(10)?,
+                        r.get::<_, i64>(11)?,
+                        r.get::<_, i64>(12)?,
+                        r.get::<_, i64>(13)?,
+                        r.get::<_, i64>(14)?,
                         r.get::<_, String>(15)?,
                     ))
                 })
@@ -1824,8 +1970,24 @@ impl KelmaSession {
         };
         let mut card_payloads = Vec::<Value>::new();
         for c in &pending_cards {
-            let (cid, guid, ord, deck, cmod, ctype, queue, due, ivl, factor, reps, lapses, left, odue, odid, data) =
-                c;
+            let (
+                cid,
+                guid,
+                ord,
+                deck,
+                cmod,
+                ctype,
+                queue,
+                due,
+                ivl,
+                factor,
+                reps,
+                lapses,
+                left,
+                odue,
+                odid,
+                data,
+            ) = c;
             card_payloads.push(json!({
                 "card_id": cid,
                 "note_guid": guid,
@@ -1844,16 +2006,36 @@ impl KelmaSession {
         let mut pushed_cards = 0usize;
         if !note_payloads.is_empty() || !card_payloads.is_empty() {
             for nchunk in note_payloads.chunks(500) {
-                let resp = v2_json("POST", endpoint, "/v2/batch/push", Some(token), Some(json!({
-                    "notes": nchunk, "cards": [], "notetypes": [], "decks": []
-                })))?;
-                pushed_notes += resp.get("accepted").and_then(|a| a.get("notes")).and_then(Value::as_u64).unwrap_or(0) as usize;
+                let resp = v2_json(
+                    "POST",
+                    endpoint,
+                    "/v2/batch/push",
+                    Some(token),
+                    Some(json!({
+                        "notes": nchunk, "cards": [], "notetypes": [], "decks": []
+                    })),
+                )?;
+                pushed_notes += resp
+                    .get("accepted")
+                    .and_then(|a| a.get("notes"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
             }
             for cchunk in card_payloads.chunks(500) {
-                let resp = v2_json("POST", endpoint, "/v2/batch/push", Some(token), Some(json!({
-                    "notes": [], "cards": cchunk, "notetypes": [], "decks": []
-                })))?;
-                pushed_cards += resp.get("accepted").and_then(|a| a.get("cards")).and_then(Value::as_u64).unwrap_or(0) as usize;
+                let resp = v2_json(
+                    "POST",
+                    endpoint,
+                    "/v2/batch/push",
+                    Some(token),
+                    Some(json!({
+                        "notes": [], "cards": cchunk, "notetypes": [], "decks": []
+                    })),
+                )?;
+                pushed_cards += resp
+                    .get("accepted")
+                    .and_then(|a| a.get("cards"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
             }
             // Mark uploaded rows as synced so we don't resend them next time.
             let db = col.storage.db();
@@ -1894,7 +2076,10 @@ impl KelmaSession {
             .and_then(Value::as_bool)
             .ok_or_else(|| "missing 'upload' boolean".to_string())?;
 
-        let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
         let col = guard
             .col
             .take()
@@ -1918,58 +2103,35 @@ impl KelmaSession {
         Ok(json!({ "completed": true, "upload": upload }))
     }
 
-    /// Download missing media through KelmaSync v2. Live v2 media progress is
-    /// not wired yet; `sync_media_start()` intentionally falls back here.
+    /// Download missing media through KelmaSync v2 with the same 50-request
+    /// concurrency used by the desktop clients.
     pub fn sync_media(&self, request: &Value) -> Result<Value, String> {
         let token = str_field(request, "hkey")?;
         let endpoint = str_field(request, "endpoint")?;
         let media_folder = {
-            let guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
             guard.media_folder_path.clone()
         };
-        std::fs::create_dir_all(&media_folder).map_err(|e| format!("create media dir: {e}"))?;
-        let manifest = v2_json("GET", &endpoint, "/v2/sync/manifest", Some(&token), None)?;
-        let files = manifest
-            .get("media")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|m| m.get("filename").and_then(Value::as_str).map(str::to_string))
-            .collect::<Vec<_>>();
-        let mut downloaded = 0usize;
-        for filename in files {
-            if filename.contains('/') || filename.contains('\\') || filename == "." || filename == ".." {
-                continue;
-            }
-            let path = std::path::Path::new(&media_folder).join(&filename);
-            if path.exists() {
-                continue;
-            }
-            match v2_bytes(&endpoint, &format!("/v2/media/{}", urlencode(&filename)), Some(&token)) {
-                Ok(bytes) => {
-                    std::fs::write(&path, bytes).map_err(|e| format!("write media {filename}: {e}"))?;
-                    downloaded += 1;
-                }
-                // The server lists the file but can't serve its bytes yet
-                // (e.g. another device hasn't re-uploaded after a dev reset).
-                // Skip instead of failing the whole media sync.
-                Err(e) if e.contains("(404") => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        let downloaded = v2_sync_media_downloads(&endpoint, &token, &media_folder, None)?;
         let (files, bytes) = media_folder_totals(&media_folder)?;
         Ok(json!({ "files": files, "bytes": bytes, "downloaded": downloaded }))
     }
 
-    /// Start a media sync on a background thread and return immediately. The
-    /// blocking transfer runs on its own thread, so `sync_media_poll` can read
-    /// live progress without waiting on the session lock. Used by the UI to show
-    /// real-time counts during a large (multi-GB) media download.
-    pub fn sync_media_start(&self, _request: &Value) -> Result<Value, String> {
-        return Err("v2 media progress is not implemented; use blocking syncMedia".to_string());
-        #[allow(unreachable_code)]
-        let auth = sync_auth_from(_request)?;
+    /// Start a 50-request v2 media download on a background thread. The UI
+    /// polls `sync_media_poll`, so review/UI work remains responsive.
+    pub fn sync_media_start(&self, request: &Value) -> Result<Value, String> {
+        let token = str_field(request, "hkey")?;
+        let endpoint = str_field(request, "endpoint")?;
+        let media_folder = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            guard.media_folder_path.clone()
+        };
 
         if self
             .media_progress
@@ -1980,25 +2142,12 @@ impl KelmaSession {
             return Err("a media sync is already running".to_string());
         }
 
-        // Build the owned media manager + progress handler under the lock, grab a
-        // handle to the shared progress cell, then release the lock.
-        let (manager, handler, progress_cell, media_folder) = {
-            let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
-            let col = guard
-                .col
-                .as_mut()
-                .ok_or_else(|| "collection is not open".to_string())?;
-            let manager = col.media().map_err(|e| format!("{e:?}"))?;
-            let handler = col.new_progress_handler();
-            let progress_cell = col.shared_progress();
-            (manager, handler, progress_cell, guard.media_folder_path.clone())
-        };
-
+        let progress = Arc::new(Mutex::new(V2MediaProgress::default()));
         let done: Arc<Mutex<Option<Result<Value, String>>>> = Arc::new(Mutex::new(None));
         *self
             .media_progress
             .lock()
-            .map_err(|_| "session poisoned".to_string())? = Some(progress_cell);
+            .map_err(|_| "session poisoned".to_string())? = Some(progress.clone());
         *self
             .media_done
             .lock()
@@ -2006,19 +2155,14 @@ impl KelmaSession {
 
         thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                block_on(manager.sync_media(handler, auth, web_client(), None))
+                v2_sync_media_downloads(&endpoint, &token, &media_folder, Some(progress))
             }));
             let result = match outcome {
-                Ok(Ok(())) => {
+                Ok(Ok(_)) => {
                     let (files, bytes) = media_folder_totals(&media_folder).unwrap_or((0, 0));
                     Ok(json!({ "files": files, "bytes": bytes }))
                 }
-                Ok(Err(error)) => {
-                    let (files, bytes) = media_folder_totals(&media_folder).unwrap_or((0, 0));
-                    Err(format!(
-                        "Media sync stopped after {files} files ({bytes} bytes): {error:?}"
-                    ))
-                }
+                Ok(Err(error)) => Err(error),
                 Err(_) => Err("media sync worker panicked".to_string()),
             };
             if let Ok(mut slot) = done.lock() {
@@ -2038,16 +2182,11 @@ impl KelmaSession {
                 .media_progress
                 .lock()
                 .map_err(|_| "session poisoned".to_string())?;
-            match cell.as_ref().and_then(|arc| arc.lock().ok().and_then(|s| s.last_progress)) {
-                Some(Progress::MediaSync(p)) => (
-                    p.checked,
-                    p.downloaded_files,
-                    p.downloaded_deletions,
-                    p.uploaded_files,
-                    p.uploaded_deletions,
-                ),
-                _ => (0, 0, 0, 0, 0),
-            }
+            let counters = match cell.as_ref().and_then(|arc| arc.lock().ok()) {
+                Some(p) => (p.checked, p.downloaded_files, 0, 0, 0),
+                None => (0, 0, 0, 0, 0),
+            };
+            counters
         };
 
         let finished = {
@@ -2121,7 +2260,10 @@ impl KelmaSession {
         // Take the collection out (full sync consumes it) and grab its progress
         // cell before moving it to the worker.
         let (col, progress_cell) = {
-            let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
             let col = guard
                 .col
                 .take()
@@ -2170,7 +2312,10 @@ impl KelmaSession {
                 .full_progress
                 .lock()
                 .map_err(|_| "session poisoned".to_string())?;
-            match cell.as_ref().and_then(|arc| arc.lock().ok().and_then(|s| s.last_progress)) {
+            match cell
+                .as_ref()
+                .and_then(|arc| arc.lock().ok().and_then(|s| s.last_progress))
+            {
                 Some(Progress::FullSync(p)) => (p.transferred_bytes, p.total_bytes),
                 _ => (0, 0),
             }
@@ -2194,7 +2339,10 @@ impl KelmaSession {
             // The collection was consumed (and replaced on disk); reopen it so
             // review can resume, whether the sync succeeded or failed.
             {
-                let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| "session poisoned".to_string())?;
                 if guard.col.is_none() {
                     let reopened = build_collection(
                         &guard.collection_path,
@@ -2235,14 +2383,19 @@ impl KelmaSession {
     /// this, a media sync has nothing local to push and downloads the server's
     /// media instead — the media half of a "reset & download from server".
     pub fn reset_media(&self) -> Result<Value, String> {
-        let mut guard = self.inner.lock().map_err(|_| "session poisoned".to_string())?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
 
         // Close the collection first so no handle keeps media.db open.
         guard.col.take();
 
         let media_dir = std::path::Path::new(&guard.media_folder_path).to_path_buf();
         if media_dir.exists() {
-            for entry in std::fs::read_dir(&media_dir).map_err(|e| format!("read media dir: {e}"))? {
+            for entry in
+                std::fs::read_dir(&media_dir).map_err(|e| format!("read media dir: {e}"))?
+            {
                 let entry = entry.map_err(|e| format!("read media entry: {e}"))?;
                 if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     let _ = std::fs::remove_file(entry.path());
@@ -2273,9 +2426,19 @@ impl KelmaSession {
 fn export_path_for(deck_name: &str) -> String {
     let slug: String = deck_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let slug = if slug.is_empty() { "export".to_owned() } else { slug };
+    let slug = if slug.is_empty() {
+        "export".to_owned()
+    } else {
+        slug
+    };
     let stamp = TimestampMillis::now().0;
     let mut path = std::env::temp_dir();
     path.push(format!("{slug}-{stamp}.apkg"));
@@ -2319,16 +2482,25 @@ fn v2_json(
             "POST" => client.post(&url),
             other => return Err(format!("unsupported v2 method {other}")),
         }
-        .header("user-agent", format!("kelma-mobile:{}", crate::ANKI_VERSION));
+        .header(
+            "user-agent",
+            format!("kelma-mobile:{}", crate::ANKI_VERSION),
+        );
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await.map_err(|e| format!("v2 request {path}: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("v2 request {path}: {e}"))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| format!("v2 read {path}: {e}"))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("v2 read {path}: {e}"))?;
         if !status.is_success() {
             return Err(format!("v2 {path} failed ({status}): {text}"));
         }
@@ -2364,30 +2536,118 @@ fn rfc3339_from_secs(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-fn v2_bytes(endpoint: &str, path: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
-    let url = format!("{}{}", endpoint.trim_end_matches('/'), path);
-    block_on(async {
-        let mut req = web_client()
-            .get(&url)
-            .header("user-agent", format!("kelma-mobile:{}", crate::ANKI_VERSION));
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
+fn v2_sync_media_downloads(
+    endpoint: &str,
+    token: &str,
+    media_folder: &str,
+    progress: Option<Arc<Mutex<V2MediaProgress>>>,
+) -> Result<usize, String> {
+    std::fs::create_dir_all(media_folder).map_err(|e| format!("create media dir: {e}"))?;
+    let manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
+    let mut checked = 0usize;
+    let mut missing = Vec::new();
+    for filename in manifest
+        .get("media")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            m.get("filename")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    {
+        if filename.contains('/') || filename.contains('\\') || filename == "." || filename == ".."
+        {
+            checked += 1;
+            continue;
         }
-        let resp = req.send().await.map_err(|e| format!("v2 media request {path}: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("v2 media {path} failed ({status}): {text}"));
+        if std::path::Path::new(media_folder).join(&filename).exists() {
+            checked += 1;
+        } else {
+            missing.push(filename);
         }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("v2 media bytes {path}: {e}"))
+    }
+    if let Some(cell) = &progress {
+        if let Ok(mut p) = cell.lock() {
+            p.checked = checked;
+        }
+    }
+
+    let endpoint = endpoint.trim_end_matches('/').to_string();
+    let token = token.to_string();
+    let media_folder = media_folder.to_string();
+    let progress_for_tasks = progress.clone();
+    block_on(async move {
+        let client = web_client();
+        let mut names = missing.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+
+        let spawn_download = |tasks: &mut tokio::task::JoinSet<Result<bool, String>>,
+                              filename: String| {
+            let client = client.clone();
+            let endpoint = endpoint.clone();
+            let token = token.clone();
+            let media_folder = media_folder.clone();
+            tasks.spawn(async move {
+                let path = format!("/v2/media/{}", urlencode(&filename));
+                let response = client
+                    .get(format!("{endpoint}{path}"))
+                    .bearer_auth(token)
+                    .header(
+                        "user-agent",
+                        format!("kelma-mobile:{}", crate::ANKI_VERSION),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| format!("v2 media request {path}: {e}"))?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(false);
+                }
+                let status = response.status();
+                if !status.is_success() {
+                    let text = response.text().await.unwrap_or_default();
+                    return Err(format!("v2 media {path} failed ({status}): {text}"));
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("v2 media bytes {path}: {e}"))?;
+                std::fs::write(std::path::Path::new(&media_folder).join(&filename), bytes)
+                    .map_err(|e| format!("write media {filename}: {e}"))?;
+                Ok(true)
+            });
+        };
+
+        for filename in names.by_ref().take(50) {
+            spawn_download(&mut tasks, filename);
+        }
+        let mut downloaded = 0usize;
+        while let Some(joined) = tasks.join_next().await {
+            let did_download = joined.map_err(|e| format!("media download task failed: {e}"))??;
+            if did_download {
+                downloaded += 1;
+            }
+            checked += 1;
+            if let Some(cell) = &progress_for_tasks {
+                if let Ok(mut p) = cell.lock() {
+                    p.checked = checked;
+                    p.downloaded_files = downloaded;
+                }
+            }
+            if let Some(filename) = names.next() {
+                spawn_download(&mut tasks, filename);
+            }
+        }
+        Ok(downloaded)
     })
 }
 
 fn deck_id_by_name(col: &mut Collection, name: &str) -> Result<Option<DeckId>, String> {
-    let names = col.get_all_deck_names(false).map_err(|e| format!("deck names: {e:?}"))?;
+    let names = col
+        .get_all_deck_names(false)
+        .map_err(|e| format!("deck names: {e:?}"))?;
     Ok(names.into_iter().find(|(_, n)| n == name).map(|(id, _)| id))
 }
 
@@ -2555,10 +2815,7 @@ fn deck_node_to_json(node: &anki_proto::decks::DeckTreeNode) -> Value {
 /// Locate a deck (by id) inside a `deck_tree()` result, recursing into
 /// children. The tree's synthetic root carries deck id 0, so the deck of
 /// interest is always one of its descendants.
-fn find_deck_node<'a>(
-    node: &'a DeckTreeNode,
-    deck_id: DeckId,
-) -> Option<&'a DeckTreeNode> {
+fn find_deck_node<'a>(node: &'a DeckTreeNode, deck_id: DeckId) -> Option<&'a DeckTreeNode> {
     if node.deck_id == deck_id.0 {
         return Some(node);
     }
@@ -2640,7 +2897,9 @@ fn graphs_to_json(deck_name: &str, days: u32, g: &anki_proto::stats::GraphsRespo
             "suspended": c.suspended, "buried": c.buried,
         })
     }
-    fn reviews_map(m: &std::collections::HashMap<i32, gr::review_counts_and_times::Reviews>) -> Value {
+    fn reviews_map(
+        m: &std::collections::HashMap<i32, gr::review_counts_and_times::Reviews>,
+    ) -> Value {
         let mut o = serde_json::Map::new();
         for (k, r) in m {
             o.insert(
@@ -2699,16 +2958,28 @@ fn graphs_to_json(deck_name: &str, days: u32, g: &anki_proto::stats::GraphsRespo
         out.insert("added".into(), json!({ "added": imap_i32(&a.added) }));
     }
     if let Some(i) = &g.intervals {
-        out.insert("intervals".into(), json!({ "intervals": imap_u32(&i.intervals) }));
+        out.insert(
+            "intervals".into(),
+            json!({ "intervals": imap_u32(&i.intervals) }),
+        );
     }
     if let Some(s) = &g.stability {
-        out.insert("stability".into(), json!({ "intervals": imap_u32(&s.intervals) }));
+        out.insert(
+            "stability".into(),
+            json!({ "intervals": imap_u32(&s.intervals) }),
+        );
     }
     if let Some(e) = &g.eases {
-        out.insert("eases".into(), json!({ "eases": imap_u32(&e.eases), "average": e.average }));
+        out.insert(
+            "eases".into(),
+            json!({ "eases": imap_u32(&e.eases), "average": e.average }),
+        );
     }
     if let Some(d) = &g.difficulty {
-        out.insert("difficulty".into(), json!({ "eases": imap_u32(&d.eases), "average": d.average }));
+        out.insert(
+            "difficulty".into(),
+            json!({ "eases": imap_u32(&d.eases), "average": d.average }),
+        );
     }
     if let Some(r) = &g.retrievability {
         out.insert(
