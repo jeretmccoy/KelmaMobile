@@ -25,7 +25,7 @@ export const KELMA_SIGNUP_URL = 'https://kelma.tech';
  * The client version string reported to the sync server. Tracks the pinned
  * Anki/rslib core so the server can apply protocol compatibility rules.
  */
-export const SYNC_CLIENT_VERSION = 'kelma-mobile,0.1.0,anki25.09.2';
+export const SYNC_CLIENT_VERSION = 'kelma-mobile,1.1.0,anki25.09.2';
 
 /** Identifier of the active profile (single-profile for now). */
 export const DEFAULT_PROFILE_ID = 'default';

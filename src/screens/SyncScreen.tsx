@@ -186,7 +186,13 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
         updateStep('collection', 'running', 'Checking collection changes…');
         setStatus('Syncing collection…');
         pushLog('Checking collection changes…');
-        const outcome = await syncCollection(credentials);
+        const outcome = await syncCollectionWithConflictPrompts(credentials);
+        if (!outcome) {
+          updateStep('collection', 'done', 'Sync cancelled — nothing discarded');
+          setStatus('Sync cancelled. No conflicting local changes were discarded.');
+          pushLog('Sync cancelled at a conflict confirmation.', 'error');
+          return;
+        }
         pushLog(`Server says: ${outcome.required}.`);
         if (outcome.required === 'fullSyncRequired') {
           // A full sync REPLACES one side wholesale — never pick a direction
@@ -751,6 +757,87 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
       </ScrollView>
     </KeyboardAvoidingView>
   );
+}
+
+type V2ConflictChoice = 'server' | 'local' | 'cancel';
+
+async function syncCollectionWithConflictPrompts(
+  auth: SyncAuth,
+): Promise<Awaited<ReturnType<typeof syncCollection>> | null> {
+  const request: SyncAuth & {
+    allowDeletions?: boolean;
+    conflictPolicy?: 'server' | 'local';
+  } = { ...auth };
+  // A retry may encounter both a deletion and a tied content conflict. Each
+  // decision is explicit and applies to this sync only.
+  for (let attempts = 0; attempts < 3; attempts += 1) {
+    try {
+      return await syncCollection(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('KELMA_DELETION_CONFIRM:') && !request.allowDeletions) {
+        const detail = message.split('KELMA_DELETION_CONFIRM:')[1]?.slice(0, 500) ?? '';
+        const approved = await promptServerDeletion(detail);
+        if (!approved) {
+          return null;
+        }
+        request.allowDeletions = true;
+        continue;
+      }
+      if (message.includes('KELMA_CONTENT_CONFIRM:') && !request.conflictPolicy) {
+        const detail = message.split('KELMA_CONTENT_CONFIRM:')[1]?.slice(0, 500) ?? '';
+        const choice = await promptContentConflict(detail);
+        if (choice === 'cancel') {
+          return null;
+        }
+        request.conflictPolicy = choice;
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('Sync could not converge after conflict choices. Please try again.');
+}
+
+function promptServerDeletion(detail: string): Promise<boolean> {
+  return new Promise(resolve => {
+    Alert.alert(
+      'Server deleted synced items',
+      `KelmaSync deleted data that has newer work on this device${detail ? `:\n\n${detail}` : '.'}\n\n` +
+        'Deleting locally will discard those device-only changes. This approval applies once.',
+      [
+        { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+        {
+          text: 'Delete locally',
+          style: 'destructive',
+          onPress: () => resolve(true),
+        },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) },
+    );
+  });
+}
+
+function promptContentConflict(detail: string): Promise<V2ConflictChoice> {
+  return new Promise(resolve => {
+    Alert.alert(
+      'Choose which version to keep',
+      `The server and this device changed the same item at the same time${detail ? `:\n\n${detail}` : '.'}`,
+      [
+        { text: 'Cancel', style: 'cancel', onPress: () => resolve('cancel') },
+        {
+          text: 'Keep this device',
+          onPress: () => resolve('local'),
+        },
+        {
+          text: 'Use server',
+          style: 'destructive',
+          onPress: () => resolve('server'),
+        },
+      ],
+      { cancelable: true, onDismiss: () => resolve('cancel') },
+    );
+  });
 }
 
 type FullSyncChoice = 'upload' | 'download' | 'cancel';

@@ -25,9 +25,9 @@ small set of coarse, rslib-backed operations through `src/core/KelmaCore.ts`:
 | `getDeckTree` | `Collection::deck_tree` |
 | `getNextCard` | `Collection::get_queued_cards` + `render_existing_card` |
 | `answerCard` | `Collection::get_scheduling_states` + `answer_card` |
-| `syncLogin` | `sync::login::sync_login` |
-| `syncCollection` | `Collection::normal_sync` |
-| `fullSync` | `Collection::full_upload` / `full_download` |
+| `syncLogin` | KelmaSync v2 `/v2/auth/login` |
+| `syncCollection` | Native v2 manifest/batch sync over rslib collections |
+| `syncMedia` | Scoped, concurrent KelmaSync v2 media transfer |
 
 On iOS these run through `rust/kelma-core` (the Kelma C ABI over the pinned
 `vendor/anki`). On Android they run through the same rslib via AnkiDroid's
@@ -35,11 +35,14 @@ On iOS these run through `rust/kelma-core` (the Kelma C ABI over the pinned
 
 ### Sync
 
-Kelma ships pointed at **KelmaSync**, the self-hosted, Anki-wire-compatible sync
-server (`~/projects/kelma_sync`). The default endpoint lives in
-[`src/config.ts`](./src/config.ts) (`DEFAULT_SYNC_ENDPOINT`). Sign in on the deck
-screen with your KelmaSync credentials; a normal sync runs automatically and the
-app falls back to a full download when the server and device schemas diverge.
+Kelma ships pointed at the production **KelmaSync v2** REST service at
+`https://sync2.ankiai.tech`. The default endpoint lives in
+[`src/config.ts`](./src/config.ts) (`DEFAULT_SYNC_ENDPOINT`). Native sync compares
+canonical checksums, transfers notes/cards in 3,000-item batches, converts
+collection-relative due dates, applies tombstones safely, uploads mobile-created
+metadata and deletions, and transfers referenced media with 50 connections.
+Tied content changes and deletion-vs-local-edit conflicts always ask the user
+which result to keep.
 
 
 ## Development
@@ -99,12 +102,17 @@ cd ..
 npm run ios
 ```
 
-Both builds use Anki core `25.09.2` at commit `3890e12c9e48`. Android loads it
-through `anki-android-backend` `0.1.64-anki25.09.2`; iOS compiles the pinned
-`vendor/anki` source through `rust/kelma-core`. The first iOS build takes longer
-because Xcode cross-compiles rslib. Later TypeScript changes still use React
-Native Fast Refresh; Rust, Kotlin, Swift, and Objective-C++ changes require a
-native rebuild.
+The unsigned AltStore release procedure and required sync regression suite are
+in [`docs/ios-release.md`](./docs/ios-release.md).
+
+Both builds target Anki core `25.09.2` at commit `3890e12c9e48`. iOS compiles
+the pinned `vendor/anki` source through `rust/kelma-core`. The first iOS build
+takes longer because Xcode cross-compiles rslib. Later TypeScript changes still
+use React Native Fast Refresh; Rust, Kotlin, Swift, and Objective-C++ changes
+require a native rebuild.
+
+> Android is not part of the iOS 1.1 rollout: its React Native module is still a
+> development stub. The real Android bridge is the next rollout milestone.
 
 ## Source baselines
 

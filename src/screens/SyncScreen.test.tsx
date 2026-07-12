@@ -21,8 +21,26 @@ jest.mock('../core/KelmaCore', () => ({
 }));
 
 import React from 'react';
+import { Alert } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
+import { syncCollection, syncMediaMonitored } from '../core/KelmaCore';
 import { SyncScreen } from './SyncScreen';
+
+const syncCollectionMock = syncCollection as jest.Mock;
+const syncMediaMock = syncMediaMonitored as jest.Mock;
+
+beforeEach(() => {
+  syncCollectionMock.mockReset();
+  syncCollectionMock.mockResolvedValue({
+    required: 'noChanges',
+    uploadOk: false,
+    downloadOk: false,
+    serverMessage: '',
+    newEndpoint: null,
+  });
+  syncMediaMock.mockReset();
+  syncMediaMock.mockResolvedValue({ files: 123, bytes: 1024 });
+});
 
 // Flush the awaited sign-in -> collection -> media promise chain.
 async function flush() {
@@ -74,4 +92,53 @@ test('starts signed-in when credentials are already persisted (no re-login)', as
   const output = JSON.stringify(renderer.toJSON());
   expect(output).toContain('Signed in');
   expect(output).toContain('Sync now');
+});
+
+test('requires one-sync approval before discarding local work on server deletion', async () => {
+  syncCollectionMock
+    .mockRejectedValueOnce(new Error('KELMA_DELETION_CONFIRM:card Arabic:0'))
+    .mockResolvedValueOnce({
+      required: 'normalSyncRequired',
+      uploadOk: false,
+      downloadOk: false,
+      serverMessage: 'applied deletion',
+      newEndpoint: null,
+    });
+  const alert = jest.spyOn(Alert, 'alert').mockImplementation((
+    _title,
+    _message,
+    buttons,
+  ) => {
+    buttons?.find(button => button.text === 'Delete locally')?.onPress?.();
+  });
+
+  let renderer!: ReactTestRenderer.ReactTestRenderer;
+  await ReactTestRenderer.act(async () => {
+    renderer = ReactTestRenderer.create(
+      <SyncScreen
+        onSynced={jest.fn()}
+        onSignedIn={jest.fn()}
+        onSignedOut={jest.fn()}
+        initialAuth={{ hkey: 'key', endpoint: 'https://sync2.ankiai.tech' }}
+      />,
+    );
+  });
+  await ReactTestRenderer.act(async () => {
+    renderer.root
+      .findByProps({ accessibilityLabel: 'Sync collection and media' })
+      .props.onPress();
+    await flush();
+  });
+
+  expect(alert).toHaveBeenCalledWith(
+    'Server deleted synced items',
+    expect.stringContaining('card Arabic:0'),
+    expect.any(Array),
+    expect.any(Object),
+  );
+  expect(syncCollectionMock).toHaveBeenCalledTimes(2);
+  expect(syncCollectionMock.mock.calls[1][0]).toMatchObject({
+    allowDeletions: true,
+  });
+  alert.mockRestore();
 });

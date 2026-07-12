@@ -1,2 +1,5 @@
 vendor/
 rust/kelma-core/target/
+android/.gradle/
+android/app/build/
+ios/build/

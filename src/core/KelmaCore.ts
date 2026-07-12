@@ -972,7 +972,16 @@ export async function syncLogin(
   return runOp<SyncAuth>('syncLogin', { username, password, endpoint });
 }
 
-export async function syncCollection(auth: SyncAuth): Promise<SyncOutcome> {
+export type SyncCollectionOptions = {
+  /** Explicit one-sync approval to discard local edits to server-deleted data. */
+  allowDeletions?: boolean;
+  /** Explicit resolution for tied content conflicts. */
+  conflictPolicy?: 'server' | 'local';
+};
+
+export async function syncCollection(
+  auth: SyncAuth & SyncCollectionOptions,
+): Promise<SyncOutcome> {
   return runOp<SyncOutcome>('syncCollection', auth);
 }
 

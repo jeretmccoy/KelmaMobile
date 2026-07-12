@@ -16,12 +16,14 @@ use anki::collection::{Collection, CollectionBuilder};
 use anki::decks::{Deck, DeckId, DeckKind, NativeDeckName};
 use anki::import_export::package::ExportAnkiPackageOptions;
 use anki::notetype::NotetypeId;
-use anki::prelude::{AnkiError, OrInvalid, OrNotFound};
+use anki::prelude::{AnkiError, NoteId, OrInvalid, OrNotFound};
 use anki::progress::{Progress, ProgressState};
 use anki::scheduler::answering::{CardAnswer, Rating};
 use anki::scheduler::states::SchedulingStates;
 use anki::search::{parse_search, JoinSearches, SearchBuilder, SearchNode, SortMode, StateKind};
-use anki::services::{CardsService, NotesService, NotetypesService, SearchService, TagsService};
+use anki::services::{
+    CardsService, DecksService, NotesService, NotetypesService, SearchService, TagsService,
+};
 use anki::sync::login::SyncAuth;
 use anki::timestamp::{TimestampMillis, TimestampSecs};
 use anki::types::Usn;
@@ -63,10 +65,19 @@ struct SessionState {
 struct V2MediaProgress {
     checked: usize,
     downloaded_files: usize,
+    uploaded_files: usize,
 }
 
 /// Build the reqwest client rslib expects for sync. It must be the same
 /// `reqwest` version rslib links against (see Cargo.toml pinning note).
+fn kelma_client_label() -> String {
+    format!(
+        "kelma-mobile:{}:anki{}",
+        env!("CARGO_PKG_VERSION"),
+        crate::ANKI_VERSION
+    )
+}
+
 fn web_client() -> reqwest::Client {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
@@ -154,6 +165,24 @@ impl KelmaSession {
             .as_mut()
             .ok_or_else(|| "collection is not open".to_string())?;
         f(col).map_err(|e| format!("{e:?}"))
+    }
+
+    /// Variant for sync helpers that need to preserve actionable protocol
+    /// errors (for example deletion/conflict confirmation markers) instead of
+    /// wrapping them in AnkiError.
+    fn with_col_result<T>(
+        &self,
+        f: impl FnOnce(&mut Collection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
+        let col = guard
+            .col
+            .as_mut()
+            .ok_or_else(|| "collection is not open".to_string())?;
+        f(col)
     }
 
     /// Full deck tree with today's study counts, as nested JSON.
@@ -609,12 +638,63 @@ impl KelmaSession {
     /// is `{cardId}`.
     pub fn delete_card(&self, request: &Value) -> Result<Value, String> {
         let card_id = i64_field(request, "cardId")?;
-        self.with_col(|col| {
-            let out = col.remove_cards(anki_proto::cards::RemoveCardsRequest {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
+        let collection_path = guard.collection_path.clone();
+        let col = guard
+            .col
+            .as_mut()
+            .ok_or_else(|| "collection is not open".to_string())?;
+        let row: Option<(String, i64, i64, i64)> = col
+            .storage
+            .db()
+            .query_row(
+                "SELECT n.guid, c.ord, c.nid, c.usn FROM cards c JOIN notes n ON n.id=c.nid WHERE c.id=?",
+                [card_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| format!("inspect card before deletion: {e}"))?;
+        let Some((guid, ord, nid, usn)) = row else {
+            return Ok(json!({ "count": 0 }));
+        };
+        let cards_on_note: i64 = col
+            .storage
+            .db()
+            .query_row("SELECT count(*) FROM cards WHERE nid=?", [nid], |r| {
+                r.get(0)
+            })
+            .unwrap_or(1);
+        let mut state = load_v2_sync_state(&collection_path);
+        let canonical_id = state.cards.iter().find_map(|(canonical, logical)| {
+            (logical.0 == guid && logical.1 == ord)
+                .then(|| canonical.parse::<i64>().ok())
+                .flatten()
+        });
+        if usn != -1 && canonical_id.is_none() {
+            return Err(
+                "Sync once before deleting this server card, so its canonical identity is known."
+                    .to_string(),
+            );
+        }
+
+        // Persist the outgoing tombstone before changing SQLite. If the app is
+        // killed between these writes, the next sync still converges safely.
+        if let Some(canonical_id) = canonical_id {
+            state.pending_cards.insert(canonical_id);
+            if cards_on_note == 1 && state.notes.contains(&guid) {
+                state.pending_notes.insert(guid.clone());
+            }
+            save_existing_v2_sync_state(&collection_path, &state)?;
+        }
+        let out = col
+            .remove_cards(anki_proto::cards::RemoveCardsRequest {
                 card_ids: vec![card_id],
-            })?;
-            Ok(json!({ "count": out.count }))
-        })
+            })
+            .map_err(|e| format!("delete card: {e:?}"))?;
+        Ok(json!({ "count": out.count }))
     }
 
     /// Toggle the "marked" tag on the card's note. `request` is `{cardId}`.
@@ -703,10 +783,11 @@ impl KelmaSession {
             })
             .unwrap_or_default();
         self.with_col(|col| {
+            let current = col.get_note(anki_proto::notes::NoteId { nid: note_id })?;
             let _ = col.update_notes(anki_proto::notes::UpdateNotesRequest {
                 notes: vec![anki_proto::notes::Note {
                     id: note_id,
-                    guid: String::new(),
+                    guid: current.guid,
                     notetype_id,
                     mtime_secs: 0,
                     usn: 0,
@@ -1306,7 +1387,7 @@ impl KelmaSession {
         let header = json!({
             "v": 11,
             "k": auth.hkey,
-            "c": format!("kelma-mobile:{}", crate::ANKI_VERSION),
+            "c": kelma_client_label(),
             "s": "",
         })
         .to_string();
@@ -1495,10 +1576,11 @@ impl KelmaSession {
             .collect::<Vec<_>>();
         let mid = server.get("mid").and_then(Value::as_i64).unwrap_or(0);
         self.with_col(|col| {
+            let current = col.get_note(anki_proto::notes::NoteId { nid })?;
             let _ = col.update_notes(anki_proto::notes::UpdateNotesRequest {
                 notes: vec![anki_proto::notes::Note {
                     id: nid,
-                    guid: String::new(),
+                    guid: current.guid,
                     notetype_id: mid,
                     mtime_secs: 0,
                     usn: 0,
@@ -1539,7 +1621,7 @@ impl KelmaSession {
             Some(json!({
                 "username": username,
                 "password": password,
-                "client_label": format!("kelma-mobile:{}", crate::ANKI_VERSION),
+                "client_label": kelma_client_label(),
             })),
         )?;
         let token = resp
@@ -1550,17 +1632,25 @@ impl KelmaSession {
         Ok(json!({ "hkey": token, "endpoint": endpoint }))
     }
 
-    /// Run a KelmaSync v2 content sync. This first mobile bridge is
-    /// intentionally conservative:
-    /// - pulls missing server decks/notetypes/notes/cards into mobile
-    /// - applies server cards by logical identity `(note_guid, ord)`
-    /// - does not silently overwrite existing changed local notes/cards
-    /// Upload of mobile-origin changes will be layered on after scheduling is
-    /// represented as absolute due dates server-side.
+    /// Run a complete KelmaSync v2 content sync:
+    /// - compares and pulls new/updated decks, notetypes, notes, and cards;
+    /// - applies cards by logical identity `(note_guid, ord)` with crt-aware due;
+    /// - uploads mobile-authored metadata, notes, reviews, and deletions;
+    /// - applies scoped tombstones and requires explicit choices for ties or
+    ///   deletion-vs-local-edit conflicts.
     pub fn sync_collection(&self, request: &Value) -> Result<Value, String> {
         let token = str_field(request, "hkey")?;
         let endpoint = str_field(request, "endpoint")?;
-        let outcome = self.v2_sync_collection(&endpoint, &token)?;
+        let allow_deletions = request
+            .get("allowDeletions")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let conflict_policy = request
+            .get("conflictPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let outcome =
+            self.v2_sync_collection(&endpoint, &token, allow_deletions, conflict_policy)?;
         Ok(json!({
             "required": if outcome.changed { "normalSyncRequired" } else { "noChanges" },
             "uploadOk": false,
@@ -1570,80 +1660,214 @@ impl KelmaSession {
         }))
     }
 
-    fn v2_sync_collection(&self, endpoint: &str, token: &str) -> Result<V2SyncOutcome, String> {
+    fn v2_sync_collection(
+        &self,
+        endpoint: &str,
+        token: &str,
+        allow_deletions: bool,
+        conflict_policy: &str,
+    ) -> Result<V2SyncOutcome, String> {
+        let (collection_path, media_folder_path) = {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "session poisoned".to_string())?;
+            (
+                guard.collection_path.clone(),
+                guard.media_folder_path.clone(),
+            )
+        };
+        let mut previous_state = load_v2_sync_state(&collection_path);
+        let pushed_deletions =
+            push_v2_pending_deletes(endpoint, token, &collection_path, &mut previous_state)?;
         let manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
-
-        // Build local note identities and structural card hashes with two SQL
-        // scans. Previously every sync downloaded every server card, then ran
-        // one identity query per card even when nothing had changed.
-        let (local_note_guids, local_cards) = self.with_col(|col| {
-            let db = col.storage.db();
-            let mut note_guids = HashSet::new();
-            let mut note_stmt = db.prepare("SELECT guid FROM notes WHERE guid <> ''")?;
-            let note_rows = note_stmt.query_map([], |row| row.get::<_, String>(0))?;
-            note_guids.extend(note_rows.filter_map(Result::ok));
-
-            let mut cards = HashMap::new();
-            let mut card_stmt = db.prepare(
-                "SELECT n.guid, c.ord, d.name, c.mod FROM cards c \
-                 JOIN notes n ON n.id=c.nid JOIN decks d ON d.id=c.did \
-                 WHERE n.guid <> ''",
-            )?;
-            let rows = card_stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?;
-            for (guid, ord, deck, modified) in rows.filter_map(Result::ok) {
-                cards.insert(
-                    format!("{guid}:{ord}"),
-                    (v2_card_checksum(&guid, &deck, ord), rfc3339_from_secs(modified)),
-                );
-            }
-            Ok((note_guids, cards))
+        let deleted = self.with_col_result(|col| {
+            apply_v2_tombstones(
+                col,
+                &manifest,
+                &previous_state,
+                &media_folder_path,
+                allow_deletions,
+            )
         })?;
 
-        let server_note_guids = manifest
+        // Build local canonical note/card hashes in two SQL scans. Existing
+        // resources are compared too: mobile must pull server edits, not only
+        // resources missing from a fresh collection.
+        let (local_notes, local_cards, local_notetypes, local_decks) =
+            self.with_col_result(|col| {
+                let notes = {
+                    let db = col.storage.db();
+                    let mut notes = HashMap::new();
+                    let mut stmt = db
+                        .prepare("SELECT guid, mod, usn, flds, tags FROM notes WHERE guid <> ''")
+                        .map_err(|e| format!("prepare local notes: {e}"))?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        })
+                        .map_err(|e| format!("query local notes: {e}"))?;
+                    for (guid, modified, usn, fields, tags) in rows.filter_map(Result::ok) {
+                        let fields = fields
+                            .split('\u{1f}')
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        let tags = tags
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        notes.insert(
+                            guid,
+                            LocalV2Note {
+                                checksum: v2_note_checksum(&fields, &tags),
+                                modified: rfc3339_from_secs(modified),
+                                usn,
+                            },
+                        );
+                    }
+                    notes
+                };
+
+                let cards = {
+                    let db = col.storage.db();
+                    let mut cards = HashMap::new();
+                    let mut stmt = db
+                        .prepare(
+                            "SELECT n.guid, c.ord, d.name, c.mod, c.usn FROM cards c \
+                         JOIN notes n ON n.id=c.nid JOIN decks d ON d.id=c.did \
+                         WHERE n.guid <> ''",
+                        )
+                        .map_err(|e| format!("prepare local cards: {e}"))?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
+                        })
+                        .map_err(|e| format!("query local cards: {e}"))?;
+                    for (guid, ord, deck, modified, usn) in rows.filter_map(Result::ok) {
+                        cards.insert(
+                            format!("{guid}:{ord}"),
+                            LocalV2Card {
+                                checksum: v2_card_checksum(&guid, &deck, ord),
+                                modified: rfc3339_from_secs(modified),
+                                usn,
+                            },
+                        );
+                    }
+                    cards
+                };
+                let notetypes = local_v2_notetype_checksums(col)?;
+                let decks = local_v2_deck_checksums(col)?;
+                Ok((notes, cards, notetypes, decks))
+            })?;
+
+        let server_notes = manifest
             .get("notes")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|note| note.get("guid").and_then(Value::as_str).map(str::to_string))
-            .filter(|guid| !local_note_guids.contains(guid))
+            .unwrap_or_default();
+        let server_note_checksums = server_notes
+            .iter()
+            .filter_map(|note| {
+                Some((
+                    note.get("guid")?.as_str()?.to_string(),
+                    note.get("checksum")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let server_note_guids = server_notes
+            .iter()
+            .filter_map(|note| note.get("guid").and_then(Value::as_str))
+            .filter(|guid| {
+                let server_checksum = server_note_checksums
+                    .get(*guid)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                local_notes
+                    .get(*guid)
+                    .map(|local| local.checksum.as_str() != server_checksum)
+                    .unwrap_or(true)
+            })
+            .map(str::to_string)
             .collect::<Vec<_>>();
-        let server_card_ids = manifest
+
+        let mut content_conflicts = Vec::new();
+        let mut server_card_ids = Vec::new();
+        for card in manifest
             .get("cards")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
-            .into_iter()
-            .filter(|card| {
-                let guid = card.get("note_guid").and_then(Value::as_str).unwrap_or("");
-                let ord = card.get("ord").and_then(Value::as_i64).unwrap_or(0);
-                let key = format!("{guid}:{ord}");
-                let Some((local_checksum, local_modified)) = local_cards.get(&key) else {
-                    return true;
-                };
-                let server_checksum = card.get("checksum").and_then(Value::as_str).unwrap_or("");
-                let server_modified = card
-                    .get("client_modified_at")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                server_checksum != local_checksum
-                    || rfc3339_second_key(server_modified) > rfc3339_second_key(local_modified)
-            })
-            .filter_map(|card| card.get("card_id").and_then(Value::as_i64))
-            .collect::<Vec<_>>();
+        {
+            let guid = card.get("note_guid").and_then(Value::as_str).unwrap_or("");
+            let ord = card.get("ord").and_then(Value::as_i64).unwrap_or(0);
+            let key = format!("{guid}:{ord}");
+            let Some(local) = local_cards.get(&key) else {
+                if let Some(card_id) = card.get("card_id").and_then(Value::as_i64) {
+                    server_card_ids.push(card_id);
+                }
+                continue;
+            };
+            let server_checksum = card.get("checksum").and_then(Value::as_str).unwrap_or("");
+            let server_modified = card
+                .get("client_modified_at")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let structural_difference = server_checksum != local.checksum;
+            let server_is_newer = rfc3339_to_secs(server_modified).unwrap_or(0)
+                > rfc3339_to_secs(&local.modified).unwrap_or(0);
+            let local_is_newer = rfc3339_to_secs(&local.modified).unwrap_or(0)
+                > rfc3339_to_secs(server_modified).unwrap_or(0);
+            let pull = if structural_difference && local.usn == -1 {
+                if server_is_newer || conflict_policy == "server" {
+                    true
+                } else if local_is_newer || conflict_policy == "local" {
+                    false
+                } else {
+                    content_conflicts.push(format!("card {key}"));
+                    false
+                }
+            } else {
+                structural_difference || server_is_newer
+            };
+            if pull {
+                if let Some(card_id) = card.get("card_id").and_then(Value::as_i64) {
+                    server_card_ids.push(card_id);
+                }
+            }
+        }
+        if !content_conflicts.is_empty() && conflict_policy.is_empty() {
+            return Err(format!(
+                "KELMA_CONTENT_CONFIRM:{}",
+                content_conflicts.join(", ")
+            ));
+        }
+
         let server_notetype_ids = manifest
             .get("notetypes")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .filter(|n| {
+                let id = n.get("notetype_id").and_then(Value::as_i64).unwrap_or(0);
+                let checksum = n.get("checksum").and_then(Value::as_str).unwrap_or("");
+                local_notetypes
+                    .get(&id)
+                    .map(|local| local != checksum)
+                    .unwrap_or(true)
+            })
             .filter_map(|n| n.get("notetype_id").and_then(Value::as_i64))
             .collect::<Vec<_>>();
         let server_deck_names = manifest
@@ -1652,6 +1876,14 @@ impl KelmaSession {
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .filter(|d| {
+                let name = d.get("name").and_then(Value::as_str).unwrap_or("");
+                let checksum = d.get("checksum").and_then(Value::as_str).unwrap_or("");
+                local_decks
+                    .get(name)
+                    .map(|local| local != checksum)
+                    .unwrap_or(true)
+            })
             .filter_map(|d| d.get("name").and_then(Value::as_str).map(str::to_string))
             .collect::<Vec<_>>();
 
@@ -1728,6 +1960,48 @@ impl KelmaSession {
             );
         }
 
+        let mut note_apply_guids = HashSet::new();
+        let mut note_conflicts = Vec::new();
+        for note in &pulled_notes {
+            let guid = note.get("guid").and_then(Value::as_str).unwrap_or("");
+            if guid.is_empty() {
+                continue;
+            }
+            let Some(local) = local_notes.get(guid) else {
+                note_apply_guids.insert(guid.to_string());
+                continue;
+            };
+            if local.usn != -1 {
+                note_apply_guids.insert(guid.to_string());
+                continue;
+            }
+            let server_modified = note
+                .get("client_modified_at")
+                .or_else(|| note.get("modified_at"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if rfc3339_to_secs(server_modified).unwrap_or(0)
+                > rfc3339_to_secs(&local.modified).unwrap_or(0)
+                || conflict_policy == "server"
+            {
+                note_apply_guids.insert(guid.to_string());
+            } else if rfc3339_to_secs(&local.modified).unwrap_or(0)
+                > rfc3339_to_secs(server_modified).unwrap_or(0)
+                || conflict_policy == "local"
+            {
+                // Keep the pending local version; it is pushed below using the
+                // manifest checksum as its optimistic-concurrency base.
+            } else {
+                note_conflicts.push(format!("note {guid}"));
+            }
+        }
+        if !note_conflicts.is_empty() && conflict_policy.is_empty() {
+            return Err(format!(
+                "KELMA_CONTENT_CONFIRM:{}",
+                note_conflicts.join(", ")
+            ));
+        }
+
         let mut guard = self
             .inner
             .lock()
@@ -1746,35 +2020,42 @@ impl KelmaSession {
             .unwrap_or(0);
         let local_crt_day = local_crt / 86400;
         let mut created_decks = 0usize;
+        let mut applied_decks = 0usize;
         for deck in &pulled_decks {
-            let name = deck
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("Default");
-            if ensure_deck(col, name)? {
+            if apply_v2_deck(col, deck)? {
                 created_decks += 1;
             }
+            applied_decks += 1;
         }
 
         let mut applied_notetypes = 0usize;
         for nt in &pulled_notetypes {
             let ntid = nt.get("notetype_id").and_then(Value::as_i64).unwrap_or(0);
-            if ntid == 0
-                || col
-                    .get_notetype(NotetypeId(ntid))
-                    .map_err(|e| format!("{e:?}"))?
-                    .is_some()
-            {
+            if ntid == 0 {
                 continue;
             }
+            let name = nt.get("name").and_then(Value::as_str).unwrap_or("Notetype");
+            prepare_v2_notetype_slot(
+                col,
+                ntid,
+                name,
+                previous_state.notetypes.contains(&ntid),
+                conflict_policy == "server",
+            )?;
             let mut definition = nt.get("definition").cloned().unwrap_or_else(|| json!({}));
             if let Some(obj) = definition.as_object_mut() {
                 obj.insert("id".to_string(), json!(ntid));
                 if let Some(name) = nt.get("name").and_then(Value::as_str) {
                     obj.insert("name".to_string(), json!(name));
                 }
-                obj.entry("mod".to_string()).or_insert(json!(0));
-                obj.entry("usn".to_string()).or_insert(json!(0));
+                let modified = nt
+                    .get("client_modified_at")
+                    .or_else(|| nt.get("modified_at"))
+                    .and_then(Value::as_str)
+                    .and_then(rfc3339_to_secs)
+                    .unwrap_or(0);
+                obj.insert("mod".to_string(), json!(modified));
+                obj.insert("usn".to_string(), json!(0));
             }
             let json_bytes =
                 serde_json::to_vec(&definition).map_err(|e| format!("notetype json: {e}"))?;
@@ -1803,21 +2084,65 @@ impl KelmaSession {
         }
 
         let mut added_notes = 0usize;
+        let mut updated_notes = 0usize;
         for note in &pulled_notes {
             let guid = note.get("guid").and_then(Value::as_str).unwrap_or("");
-            if guid.is_empty() {
+            if guid.is_empty() || !note_apply_guids.contains(guid) {
                 continue;
             }
-            let exists: Option<i64> = col
+            let existing: Option<i64> = col
                 .storage
                 .db()
                 .query_row("SELECT id FROM notes WHERE guid = ?", [guid], |r| r.get(0))
                 .optional()
                 .map_err(|e| format!("check note {guid}: {e}"))?;
-            if exists.is_some() {
+            let ntid = note.get("notetype_id").and_then(Value::as_i64).unwrap_or(0);
+            let fields = note
+                .get("fields")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>();
+            let tags = note
+                .get("tags")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            let modified = note
+                .get("client_modified_at")
+                .or_else(|| note.get("modified_at"))
+                .and_then(Value::as_str)
+                .and_then(rfc3339_to_secs)
+                .unwrap_or(0);
+
+            if let Some(nid) = existing {
+                let _ = col
+                    .update_notes(anki_proto::notes::UpdateNotesRequest {
+                        notes: vec![anki_proto::notes::Note {
+                            id: nid,
+                            guid: guid.to_string(),
+                            notetype_id: ntid,
+                            mtime_secs: modified.clamp(0, u32::MAX as i64) as u32,
+                            usn: 0,
+                            tags,
+                            fields,
+                        }],
+                        skip_undo_entry: true,
+                    })
+                    .map_err(|e| format!("update note {guid}: {e:?}"))?;
+                col.storage
+                    .db()
+                    .execute("UPDATE notes SET mod=?, usn=0 WHERE id=?", (modified, nid))
+                    .map_err(|e| format!("stamp note {guid}: {e}"))?;
+                updated_notes += 1;
                 continue;
             }
-            let ntid = note.get("notetype_id").and_then(Value::as_i64).unwrap_or(0);
+
             let nt = col
                 .get_notetype(NotetypeId(ntid))
                 .map_err(|e| format!("get notetype {ntid}: {e:?}"))?
@@ -1826,33 +2151,21 @@ impl KelmaSession {
             ensure_deck(col, deck_name)?;
             let did = deck_id_by_name(col, deck_name)?.unwrap_or(DeckId(1));
             let mut local = nt.new_note();
-            let fields = note
-                .get("fields")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
             for (idx, field) in fields.iter().enumerate() {
                 if idx < local.fields().len() {
                     local
-                        .set_field(idx, field.as_str().unwrap_or("").to_string())
+                        .set_field(idx, field.clone())
                         .map_err(|e| format!("set note field {guid}: {e:?}"))?;
                 }
             }
-            local.tags = note
-                .get("tags")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
+            local.tags = tags;
             col.add_note(&mut local, did)
                 .map_err(|e| format!("add note {guid}: {e:?}"))?;
             col.storage
                 .db()
                 .execute(
-                    "UPDATE notes SET guid = ?, usn = 0 WHERE id = ?",
-                    (&guid, local.id.0),
+                    "UPDATE notes SET guid = ?, mod = ?, usn = 0 WHERE id = ?",
+                    (&guid, modified, local.id.0),
                 )
                 .map_err(|e| format!("stamp guid {guid}: {e}"))?;
             added_notes += 1;
@@ -1865,13 +2178,15 @@ impl KelmaSession {
             let mut stmt = db.prepare(
                 "SELECT n.guid, c.ord, c.id FROM cards c JOIN notes n ON n.id=c.nid WHERE n.guid <> ''",
             ).map_err(|e| format!("prepare local card identities: {e}"))?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            }).map_err(|e| format!("query local card identities: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("query local card identities: {e}"))?;
             rows.filter_map(Result::ok)
                 .map(|(guid, ord, card_id)| (format!("{guid}:{ord}"), card_id))
                 .collect()
@@ -1929,12 +2244,18 @@ impl KelmaSession {
             } else {
                 s_i64("odue")
             };
+            let modified = card
+                .get("client_modified_at")
+                .or_else(|| card.get("modified_at"))
+                .and_then(Value::as_str)
+                .and_then(rfc3339_to_secs)
+                .unwrap_or(0);
             col.storage.db().execute(
-                "UPDATE cards SET did=?, type=?, queue=?, due=?, ivl=?, factor=?, reps=?, lapses=?, left=?, odue=?, odid=?, flags=?, data=?, usn=0 WHERE id=?",
+                "UPDATE cards SET did=?, type=?, queue=?, due=?, ivl=?, factor=?, reps=?, lapses=?, left=?, odue=?, odid=?, flags=?, data=?, mod=?, usn=0 WHERE id=?",
                 rusqlite::params![
                     did.0, s_i64("type"), queue, due, s_i64("ivl"),
                     s_i64("factor"), s_i64("reps"), s_i64("lapses"), s_i64("left"),
-                    odue, s_i64("odid"), s_i64("flags"), s_str("data"), cid
+                    odue, s_i64("odid"), s_i64("flags"), s_str("data"), modified, cid
                 ],
             )
             .map_err(|e| format!("apply card {guid}:{ord}: {e}"))?;
@@ -1943,7 +2264,6 @@ impl KelmaSession {
 
         // --- Upload local changes (usn = -1 marks rows changed since last sync,
         // e.g. a card answered during review, or a note edited on device). ---
-        let now_secs = TimestampSecs::now().0;
 
         // Pending notes -> push as v2 note records.
         let pending_notes: Vec<(String, i64, i64, String, String)> = {
@@ -1967,14 +2287,26 @@ impl KelmaSession {
             rows.filter_map(Result::ok).collect()
         };
         let mut note_payloads = Vec::<Value>::new();
+        let mut already_synced_note_guids = Vec::<String>::new();
         for (guid, mid, nmod, flds, tags) in &pending_notes {
+            let fields = flds.split('\u{1f}').map(str::to_string).collect::<Vec<_>>();
+            let tags = tags
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let checksum = v2_note_checksum(&fields, &tags);
+            let server_checksum = server_note_checksums.get(guid).map(String::as_str);
+            if server_checksum == Some(checksum.as_str()) {
+                already_synced_note_guids.push(guid.clone());
+                continue;
+            }
             note_payloads.push(json!({
                 "guid": guid,
                 "notetype_id": mid,
-                "fields": flds.split('\u{1f}').collect::<Vec<_>>(),
-                "tags": tags.split_whitespace().collect::<Vec<_>>(),
+                "fields": fields,
+                "tags": tags,
                 "client_modified_at": rfc3339_from_secs(*nmod),
-                "base_checksum": "",
+                "base_checksum": server_checksum.unwrap_or(""),
             }));
         }
 
@@ -1996,13 +2328,14 @@ impl KelmaSession {
             i64,
             i64,
             i64,
+            i64,
             String,
         )> = {
             let db = col.storage.db();
             let mut stmt = db
                 .prepare(
                     "SELECT c.id, n.guid, c.ord, d.name, c.mod, c.type, c.queue, c.due, c.ivl, c.factor, \
-                            c.reps, c.lapses, c.left, c.odue, c.odid, c.data \
+                            c.reps, c.lapses, c.left, c.odue, c.odid, c.flags, c.data \
                      FROM cards c JOIN notes n ON n.id = c.nid JOIN decks d ON d.id = c.did \
                      WHERE c.usn = -1 AND n.guid <> ''",
                 )
@@ -2025,7 +2358,8 @@ impl KelmaSession {
                         r.get::<_, i64>(12)?,
                         r.get::<_, i64>(13)?,
                         r.get::<_, i64>(14)?,
-                        r.get::<_, String>(15)?,
+                        r.get::<_, i64>(15)?,
+                        r.get::<_, String>(16)?,
                     ))
                 })
                 .map_err(|e| format!("map pending cards: {e}"))?;
@@ -2049,6 +2383,7 @@ impl KelmaSession {
                 left,
                 odue,
                 odid,
+                flags,
                 data,
             ) = c;
             card_payloads.push(json!({
@@ -2059,64 +2394,198 @@ impl KelmaSession {
                 "scheduling": {
                     "type": ctype, "queue": queue, "due": due, "ivl": ivl, "factor": factor,
                     "reps": reps, "lapses": lapses, "left": left, "odue": odue, "odid": odid,
-                    "flags": 0, "data": data, "_crt": local_crt,
+                    "flags": flags, "data": data, "_crt": local_crt,
                 },
                 "client_modified_at": rfc3339_from_secs(*cmod),
             }));
         }
 
-        let mut pushed_notes = 0usize;
-        let mut pushed_cards = 0usize;
-        if !note_payloads.is_empty() || !card_payloads.is_empty() {
-            for nchunk in note_payloads.chunks(3000) {
-                let resp = v2_json(
-                    "POST",
-                    endpoint,
-                    "/v2/batch/push",
-                    Some(token),
-                    Some(json!({
-                        "notes": nchunk, "cards": [], "notetypes": [], "decks": []
-                    })),
-                )?;
-                pushed_notes += resp
-                    .get("accepted")
-                    .and_then(|a| a.get("notes"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
-            }
-            for cchunk in card_payloads.chunks(3000) {
-                let resp = v2_json(
-                    "POST",
-                    endpoint,
-                    "/v2/batch/push",
-                    Some(token),
-                    Some(json!({
-                        "notes": [], "cards": cchunk, "notetypes": [], "decks": []
-                    })),
-                )?;
-                pushed_cards += resp
-                    .get("accepted")
-                    .and_then(|a| a.get("cards"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
-            }
-            // Mark uploaded rows as synced so we don't resend them next time.
-            let db = col.storage.db();
-            db.execute("UPDATE notes SET usn = 0 WHERE usn = -1 AND guid <> ''", [])
-                .map_err(|e| format!("clear note usn: {e}"))?;
-            db.execute(
-                "UPDATE cards SET usn = 0 WHERE usn = -1 AND nid IN (SELECT id FROM notes WHERE guid <> '')",
-                [],
-            )
-            .map_err(|e| format!("clear card usn: {e}"))?;
+        // Mobile-created notes/cards may reference metadata that does not exist
+        // on the server yet. Publish that metadata first so FK validation can
+        // never reject the content batch.
+        let server_notetype_set = manifest
+            .get("notetypes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.get("notetype_id").and_then(Value::as_i64))
+            .collect::<HashSet<_>>();
+        let server_deck_set = manifest
+            .get("decks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect::<HashSet<_>>();
+        let missing_notetypes = note_payloads
+            .iter()
+            .filter_map(|n| n.get("notetype_id").and_then(Value::as_i64))
+            .filter(|id| !server_notetype_set.contains(id))
+            .collect::<HashSet<_>>();
+        let missing_decks = card_payloads
+            .iter()
+            .filter_map(|c| {
+                c.get("deck_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|name| !server_deck_set.contains(name))
+            .collect::<HashSet<_>>();
+        let mut notetype_payloads = Vec::new();
+        for ntid in missing_notetypes {
+            notetype_payloads.push(v2_notetype_payload(col, ntid)?);
         }
-        let _ = now_secs;
+        let mut deck_payloads = Vec::new();
+        for name in missing_decks {
+            deck_payloads.push(v2_deck_payload(col, &name)?);
+        }
+
+        let mut pushed_notetypes = 0usize;
+        for chunk in notetype_payloads.chunks(200) {
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/push",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": [], "notetypes": chunk, "decks": []
+                })),
+            )?;
+            ensure_v2_batch_without_conflicts(&resp, "notetypes", chunk.len())?;
+            pushed_notetypes += chunk.len();
+        }
+        let mut pushed_decks = 0usize;
+        for chunk in deck_payloads.chunks(200) {
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/push",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": [], "notetypes": [], "decks": chunk
+                })),
+            )?;
+            ensure_v2_batch_without_conflicts(&resp, "decks", chunk.len())?;
+            pushed_decks += chunk.len();
+        }
+
+        let db = col.storage.db();
+        for guid in &already_synced_note_guids {
+            db.execute("UPDATE notes SET usn=0 WHERE guid=? AND usn=-1", [guid])
+                .map_err(|e| format!("clear matching note {guid}: {e}"))?;
+        }
+
+        let mut pushed_notes = 0usize;
+        let mut accepted_note_guids = Vec::<String>::new();
+        for chunk in note_payloads.chunks(3000) {
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/push",
+                Some(token),
+                Some(json!({
+                    "notes": chunk, "cards": [], "notetypes": [], "decks": []
+                })),
+            )?;
+            let conflicts = resp
+                .get("conflicts")
+                .and_then(|v| v.get("notes"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !conflicts.is_empty() {
+                let ids = conflicts
+                    .iter()
+                    .filter_map(|v| v.get("guid").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!("KELMA_CONTENT_CONFIRM:note {ids}"));
+            }
+            let accepted = resp
+                .get("accepted")
+                .and_then(|a| a.get("notes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if accepted != chunk.len() {
+                return Err(format!(
+                    "server accepted {accepted}/{} notes; keeping them pending",
+                    chunk.len()
+                ));
+            }
+            pushed_notes += accepted;
+            accepted_note_guids.extend(
+                chunk
+                    .iter()
+                    .filter_map(|v| v.get("guid").and_then(Value::as_str).map(str::to_string)),
+            );
+        }
+        for guid in &accepted_note_guids {
+            db.execute("UPDATE notes SET usn=0 WHERE guid=? AND usn=-1", [guid])
+                .map_err(|e| format!("clear uploaded note {guid}: {e}"))?;
+        }
+
+        let mut pushed_cards = 0usize;
+        let mut accepted_cards = Vec::<(String, i64)>::new();
+        for chunk in card_payloads.chunks(3000) {
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/push",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": chunk, "notetypes": [], "decks": []
+                })),
+            )?;
+            let accepted = resp
+                .get("accepted")
+                .and_then(|a| a.get("cards"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            pushed_cards += accepted;
+            // Cards are newest-wins. If all were accepted, we know exactly
+            // which local rows converged. If a concurrent newer server card
+            // caused a skip, leave the whole chunk pending for the next pull.
+            if accepted == chunk.len() {
+                accepted_cards.extend(chunk.iter().filter_map(|v| {
+                    Some((
+                        v.get("note_guid")?.as_str()?.to_string(),
+                        v.get("ord")?.as_i64()?,
+                    ))
+                }));
+            }
+        }
+        for (guid, ord) in &accepted_cards {
+            db.execute(
+                "UPDATE cards SET usn=0 WHERE usn=-1 AND ord=? AND nid IN (SELECT id FROM notes WHERE guid=?)",
+                (ord, guid),
+            )
+            .map_err(|e| format!("clear uploaded card {guid}:{ord}: {e}"))?;
+        }
+
+        // Capture canonical card IDs after pushes so future card tombstones can
+        // be resolved to this collection's logical (guid, ord) identity.
+        let final_manifest = if pushed_notes + pushed_cards + pushed_notetypes + pushed_decks > 0 {
+            v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?
+        } else {
+            manifest.clone()
+        };
+        drop(guard);
+        save_v2_sync_state(&collection_path, &final_manifest, &previous_state)?;
 
         Ok(V2SyncOutcome {
-            changed: added_notes > 0 || applied_cards > 0 || applied_notetypes > 0
-                || created_decks > 0 || pushed_notes > 0 || pushed_cards > 0,
+            changed: deleted > 0
+                || pushed_deletions > 0
+                || added_notes > 0
+                || updated_notes > 0
+                || applied_cards > 0
+                || applied_notetypes > 0
+                || applied_decks > 0
+                || pushed_notes > 0
+                || pushed_cards > 0
+                || pushed_notetypes > 0
+                || pushed_decks > 0,
             message: format!(
-                "v2 sync: pulled {created_decks} deck(s), {applied_notetypes} notetype(s), {added_notes} note(s), {applied_cards} card(s); pushed {pushed_notes} note(s), {pushed_cards} card(s)"
+                "v2 sync: pushed {pushed_deletions} local deletion(s), applied {deleted} server deletion(s); pulled {applied_decks} deck(s) ({created_decks} new), {applied_notetypes} notetype(s), {added_notes} new + {updated_notes} updated note(s), {applied_cards} card(s); pushed {pushed_decks} deck(s), {pushed_notetypes} notetype(s), {pushed_notes} note(s), {pushed_cards} card(s)"
             ),
         })
     }
@@ -2166,34 +2635,55 @@ impl KelmaSession {
         Ok(json!({ "completed": true, "upload": upload }))
     }
 
-    /// Download missing media through KelmaSync v2 with the same 50-request
+    /// Sync referenced media through KelmaSync v2 with the same 50-request
     /// concurrency used by the desktop clients.
     pub fn sync_media(&self, request: &Value) -> Result<Value, String> {
         let token = str_field(request, "hkey")?;
         let endpoint = str_field(request, "endpoint")?;
-        let media_folder = {
-            let guard = self
+        let (collection_path, media_folder, refs) = {
+            let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| "session poisoned".to_string())?;
-            guard.media_folder_path.clone()
+            let collection_path = guard.collection_path.clone();
+            let media_folder = guard.media_folder_path.clone();
+            let col = guard
+                .col
+                .as_mut()
+                .ok_or_else(|| "collection is not open".to_string())?;
+            let refs = referenced_v2_media(col)?;
+            (collection_path, media_folder, refs)
         };
-        let downloaded = v2_sync_media_downloads(&endpoint, &token, &media_folder, None)?;
+        let downloaded = v2_sync_media_downloads(
+            &endpoint,
+            &token,
+            &collection_path,
+            &media_folder,
+            refs,
+            None,
+        )?;
         let (files, bytes) = media_folder_totals(&media_folder)?;
         Ok(json!({ "files": files, "bytes": bytes, "downloaded": downloaded }))
     }
 
-    /// Start a 50-request v2 media download on a background thread. The UI
+    /// Start a 50-request v2 media sync on a background thread. The UI
     /// polls `sync_media_poll`, so review/UI work remains responsive.
     pub fn sync_media_start(&self, request: &Value) -> Result<Value, String> {
         let token = str_field(request, "hkey")?;
         let endpoint = str_field(request, "endpoint")?;
-        let media_folder = {
-            let guard = self
+        let (collection_path, media_folder, refs) = {
+            let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| "session poisoned".to_string())?;
-            guard.media_folder_path.clone()
+            let collection_path = guard.collection_path.clone();
+            let media_folder = guard.media_folder_path.clone();
+            let col = guard
+                .col
+                .as_mut()
+                .ok_or_else(|| "collection is not open".to_string())?;
+            let refs = referenced_v2_media(col)?;
+            (collection_path, media_folder, refs)
         };
 
         if self
@@ -2218,7 +2708,14 @@ impl KelmaSession {
 
         thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                v2_sync_media_downloads(&endpoint, &token, &media_folder, Some(progress))
+                v2_sync_media_downloads(
+                    &endpoint,
+                    &token,
+                    &collection_path,
+                    &media_folder,
+                    refs,
+                    Some(progress),
+                )
             }));
             let result = match outcome {
                 Ok(Ok(_)) => {
@@ -2246,7 +2743,7 @@ impl KelmaSession {
                 .lock()
                 .map_err(|_| "session poisoned".to_string())?;
             let counters = match cell.as_ref().and_then(|arc| arc.lock().ok()) {
-                Some(p) => (p.checked, p.downloaded_files, 0, 0, 0),
+                Some(p) => (p.checked, p.downloaded_files, 0, p.uploaded_files, 0),
                 None => (0, 0, 0, 0, 0),
             };
             counters
@@ -2530,6 +3027,802 @@ struct V2SyncOutcome {
     message: String,
 }
 
+struct LocalV2Note {
+    checksum: String,
+    modified: String,
+    usn: i64,
+}
+
+struct LocalV2Card {
+    checksum: String,
+    modified: String,
+    usn: i64,
+}
+
+#[derive(Default)]
+struct V2SyncState {
+    initialized: bool,
+    notes: HashSet<String>,
+    cards: HashMap<String, (String, i64)>,
+    notetypes: HashSet<i64>,
+    decks: HashSet<String>,
+    media: HashSet<String>,
+    pending_notes: HashSet<String>,
+    pending_cards: HashSet<i64>,
+    downloaded_media: HashMap<String, String>,
+}
+
+enum V2LocalDeletion {
+    Note { guid: String, nid: i64 },
+    Card { guid: String, ord: i64, cid: i64 },
+    Deck { name: String, did: i64 },
+    Notetype(i64),
+    Media(String),
+}
+
+fn v2_state_path(collection_path: &str) -> String {
+    format!("{collection_path}.kelma-v2-state.json")
+}
+
+fn load_v2_sync_state(collection_path: &str) -> V2SyncState {
+    let Ok(bytes) = std::fs::read(v2_state_path(collection_path)) else {
+        return V2SyncState::default();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return V2SyncState::default();
+    };
+    let mut state = V2SyncState {
+        initialized: value.get("version").and_then(Value::as_i64).unwrap_or(0) >= 1,
+        ..V2SyncState::default()
+    };
+    state.notes = json_string_set(value.get("notes"));
+    state.notetypes = value
+        .get("notetypes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect();
+    state.decks = json_string_set(value.get("decks"));
+    state.media = json_string_set(value.get("media"));
+    state.pending_notes = json_string_set(value.get("pendingNotes"));
+    state.pending_cards = value
+        .get("pendingCards")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect();
+    state.downloaded_media = value
+        .get("downloadedMedia")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, modified)| Some((name.clone(), modified.as_str()?.to_string())))
+        .collect();
+    if let Some(cards) = value.get("cards").and_then(Value::as_object) {
+        for (canonical_id, logical) in cards {
+            let guid = logical.get("guid").and_then(Value::as_str).unwrap_or("");
+            let ord = logical.get("ord").and_then(Value::as_i64).unwrap_or(0);
+            if !guid.is_empty() {
+                state
+                    .cards
+                    .insert(canonical_id.clone(), (guid.to_string(), ord));
+            }
+        }
+    }
+    state
+}
+
+fn json_string_set(value: Option<&Value>) -> HashSet<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn save_v2_sync_state(
+    collection_path: &str,
+    manifest: &Value,
+    pending: &V2SyncState,
+) -> Result<(), String> {
+    let notes = manifest
+        .get("notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("guid").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let notetypes = manifest
+        .get("notetypes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("notetype_id").and_then(Value::as_i64))
+        .collect::<Vec<_>>();
+    let decks = manifest
+        .get("decks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let media = manifest
+        .get("media")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("filename").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let mut cards = serde_json::Map::new();
+    for card in manifest
+        .get("cards")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(card_id) = card.get("card_id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let guid = card.get("note_guid").and_then(Value::as_str).unwrap_or("");
+        let ord = card.get("ord").and_then(Value::as_i64).unwrap_or(0);
+        if !guid.is_empty() {
+            cards.insert(card_id.to_string(), json!({ "guid": guid, "ord": ord }));
+        }
+    }
+    let state = json!({
+        "version": 1,
+        "serverTime": manifest.get("server_time").cloned().unwrap_or(Value::Null),
+        "notes": notes,
+        "cards": cards,
+        "notetypes": notetypes,
+        "decks": decks,
+        "media": media,
+        "pendingNotes": pending.pending_notes,
+        "pendingCards": pending.pending_cards,
+        "downloadedMedia": pending.downloaded_media,
+    });
+    let path = v2_state_path(collection_path);
+    let temporary = format!("{path}.tmp");
+    let bytes = serde_json::to_vec(&state).map_err(|e| format!("encode v2 state: {e}"))?;
+    let mut file =
+        std::fs::File::create(&temporary).map_err(|e| format!("create v2 state: {e}"))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .map_err(|e| format!("write v2 state: {e}"))?;
+    file.sync_all().map_err(|e| format!("sync v2 state: {e}"))?;
+    std::fs::rename(&temporary, &path).map_err(|e| format!("install v2 state: {e}"))
+}
+
+fn save_existing_v2_sync_state(collection_path: &str, state: &V2SyncState) -> Result<(), String> {
+    let mut cards = serde_json::Map::new();
+    for (canonical_id, (guid, ord)) in &state.cards {
+        cards.insert(canonical_id.clone(), json!({ "guid": guid, "ord": ord }));
+    }
+    let value = json!({
+        "version": 1,
+        "notes": state.notes,
+        "cards": cards,
+        "notetypes": state.notetypes,
+        "decks": state.decks,
+        "media": state.media,
+        "pendingNotes": state.pending_notes,
+        "pendingCards": state.pending_cards,
+        "downloadedMedia": state.downloaded_media,
+    });
+    let path = v2_state_path(collection_path);
+    let temporary = format!("{path}.tmp");
+    let bytes = serde_json::to_vec(&value).map_err(|e| format!("encode v2 state: {e}"))?;
+    let mut file =
+        std::fs::File::create(&temporary).map_err(|e| format!("create v2 state: {e}"))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .map_err(|e| format!("write v2 state: {e}"))?;
+    file.sync_all().map_err(|e| format!("sync v2 state: {e}"))?;
+    std::fs::rename(&temporary, &path).map_err(|e| format!("install v2 state: {e}"))
+}
+
+fn manifest_string_set(manifest: &Value, resource: &str, key: &str) -> HashSet<String> {
+    manifest
+        .get(resource)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get(key).and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+fn manifest_i64_set(manifest: &Value, resource: &str, key: &str) -> HashSet<i64> {
+    manifest
+        .get(resource)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get(key).and_then(Value::as_i64))
+        .collect()
+}
+
+fn push_v2_pending_deletes(
+    endpoint: &str,
+    token: &str,
+    collection_path: &str,
+    state: &mut V2SyncState,
+) -> Result<usize, String> {
+    let mut notes = state.pending_notes.iter().cloned().collect::<Vec<_>>();
+    let mut cards = state.pending_cards.iter().copied().collect::<Vec<_>>();
+    notes.sort();
+    cards.sort_unstable();
+    let requested = notes.len() + cards.len();
+    if requested == 0 {
+        return Ok(0);
+    }
+
+    let mut batch_available = true;
+    for chunk in notes.chunks(3000) {
+        if batch_available {
+            match v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/delete",
+                Some(token),
+                Some(json!({
+                    "notes": chunk, "cards": [], "notetypes": [], "decks": []
+                })),
+            ) {
+                Ok(_) => continue,
+                Err(error) if error.contains("404 Not Found") => batch_available = false,
+                Err(error) => return Err(error),
+            }
+        }
+        for guid in chunk {
+            v2_json(
+                "DELETE",
+                endpoint,
+                &format!("/v2/notes/{}", urlencode(guid)),
+                Some(token),
+                None,
+            )?;
+        }
+    }
+    for chunk in cards.chunks(3000) {
+        if batch_available {
+            match v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/delete",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": chunk, "notetypes": [], "decks": []
+                })),
+            ) {
+                Ok(_) => continue,
+                Err(error) if error.contains("404 Not Found") => batch_available = false,
+                Err(error) => return Err(error),
+            }
+        }
+        for card_id in chunk {
+            v2_json(
+                "DELETE",
+                endpoint,
+                &format!("/v2/cards/{card_id}"),
+                Some(token),
+                None,
+            )?;
+        }
+    }
+    state.pending_notes.clear();
+    state.pending_cards.clear();
+    save_existing_v2_sync_state(collection_path, state)?;
+    Ok(requested)
+}
+
+fn apply_v2_tombstones(
+    col: &mut Collection,
+    manifest: &Value,
+    state: &V2SyncState,
+    media_folder: &str,
+    allow_deletions: bool,
+) -> Result<usize, String> {
+    let current_notes = manifest_string_set(manifest, "notes", "guid");
+    let current_cards = manifest_i64_set(manifest, "cards", "card_id");
+    let current_notetypes = manifest_i64_set(manifest, "notetypes", "notetype_id");
+    let current_decks = manifest_string_set(manifest, "decks", "name");
+    let current_media = manifest_string_set(manifest, "media", "filename");
+    let tombstones = manifest
+        .get("tombstones")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut planned = Vec::<V2LocalDeletion>::new();
+    let mut conflicts = Vec::<String>::new();
+    for wanted_type in ["note", "card", "deck", "notetype", "media"] {
+        for tombstone in tombstones
+            .iter()
+            .filter(|t| t.get("type").and_then(Value::as_str) == Some(wanted_type))
+        {
+            let rid = tombstone
+                .get("resource_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if rid.is_empty() {
+                continue;
+            }
+            match wanted_type {
+                "note" => {
+                    if current_notes.contains(rid) {
+                        continue; // resource was restored after an older tombstone
+                    }
+                    if state.initialized && !state.notes.contains(rid) {
+                        continue;
+                    }
+                    let row: Option<(i64, i64)> = col
+                        .storage
+                        .db()
+                        .query_row("SELECT id, usn FROM notes WHERE guid=?", [rid], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })
+                        .optional()
+                        .map_err(|e| format!("check note tombstone {rid}: {e}"))?;
+                    let Some((nid, usn)) = row else { continue };
+                    let pending_cards: i64 = col
+                        .storage
+                        .db()
+                        .query_row(
+                            "SELECT count(*) FROM cards WHERE nid=? AND usn=-1",
+                            [nid],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if usn == -1 || pending_cards > 0 {
+                        conflicts.push(format!("note {rid}"));
+                    }
+                    planned.push(V2LocalDeletion::Note {
+                        guid: rid.to_string(),
+                        nid,
+                    });
+                }
+                "card" => {
+                    let Ok(canonical_id) = rid.parse::<i64>() else {
+                        continue;
+                    };
+                    if current_cards.contains(&canonical_id) {
+                        continue;
+                    }
+                    let logical = state.cards.get(rid).cloned();
+                    let row: Option<(String, i64, i64, i64)> = if let Some((guid, ord)) = logical {
+                        col.storage
+                            .db()
+                            .query_row(
+                                "SELECT n.guid, c.ord, c.id, c.usn FROM cards c JOIN notes n ON n.id=c.nid WHERE n.guid=? AND c.ord=?",
+                                (&guid, ord),
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                            )
+                            .optional()
+                            .map_err(|e| format!("check card tombstone {rid}: {e}"))?
+                    } else if !state.initialized {
+                        col.storage
+                            .db()
+                            .query_row(
+                                "SELECT n.guid, c.ord, c.id, c.usn FROM cards c JOIN notes n ON n.id=c.nid WHERE c.id=?",
+                                [canonical_id],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                            )
+                            .optional()
+                            .map_err(|e| format!("check legacy card tombstone {rid}: {e}"))?
+                    } else {
+                        None
+                    };
+                    let Some((guid, ord, cid, usn)) = row else {
+                        continue;
+                    };
+                    if usn == -1 {
+                        conflicts.push(format!("card {guid}:{ord}"));
+                    }
+                    planned.push(V2LocalDeletion::Card { guid, ord, cid });
+                }
+                "deck" => {
+                    let child_prefix = format!("{rid}::");
+                    if current_decks.contains(rid)
+                        || current_decks
+                            .iter()
+                            .any(|name| name.starts_with(&child_prefix))
+                        || !state.initialized
+                        || !state.decks.contains(rid)
+                    {
+                        continue;
+                    }
+                    let Some(did) = deck_id_by_name(col, rid)? else {
+                        continue;
+                    };
+                    let pending: i64 = col
+                        .storage
+                        .db()
+                        .query_row(
+                            "SELECT count(*) FROM cards WHERE did=? AND usn=-1",
+                            [did.0],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if pending > 0 {
+                        conflicts.push(format!("deck {rid}"));
+                    }
+                    planned.push(V2LocalDeletion::Deck {
+                        name: rid.to_string(),
+                        did: did.0,
+                    });
+                }
+                "notetype" => {
+                    let Ok(ntid) = rid.parse::<i64>() else {
+                        continue;
+                    };
+                    if current_notetypes.contains(&ntid)
+                        || !state.initialized
+                        || !state.notetypes.contains(&ntid)
+                    {
+                        continue;
+                    }
+                    if col
+                        .get_notetype(NotetypeId(ntid))
+                        .map_err(|e| format!("check notetype {ntid}: {e:?}"))?
+                        .is_some()
+                    {
+                        planned.push(V2LocalDeletion::Notetype(ntid));
+                    }
+                }
+                "media" => {
+                    if current_media.contains(rid)
+                        || !state.initialized
+                        || !state.media.contains(rid)
+                        || !safe_media_name(rid)
+                    {
+                        continue;
+                    }
+                    planned.push(V2LocalDeletion::Media(rid.to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+    if !conflicts.is_empty() && !allow_deletions {
+        return Err(format!("KELMA_DELETION_CONFIRM:{}", conflicts.join(", ")));
+    }
+
+    let mut applied = 0usize;
+    for deletion in planned {
+        match deletion {
+            V2LocalDeletion::Note { guid, nid } => {
+                if col
+                    .storage
+                    .db()
+                    .query_row("SELECT 1 FROM notes WHERE id=?", [nid], |_| Ok(()))
+                    .optional()
+                    .map_err(|e| format!("recheck note {guid}: {e}"))?
+                    .is_some()
+                {
+                    col.remove_notes(&[NoteId(nid)])
+                        .map_err(|e| format!("delete note {guid}: {e:?}"))?;
+                    applied += 1;
+                }
+            }
+            V2LocalDeletion::Card { guid, ord, cid } => {
+                let exists: bool = col
+                    .storage
+                    .db()
+                    .query_row("SELECT 1 FROM cards WHERE id=?", [cid], |_| Ok(()))
+                    .optional()
+                    .map_err(|e| format!("recheck card {guid}:{ord}: {e}"))?
+                    .is_some();
+                if exists {
+                    let _ = col
+                        .remove_cards(anki_proto::cards::RemoveCardsRequest {
+                            card_ids: vec![cid],
+                        })
+                        .map_err(|e| format!("delete card {guid}:{ord}: {e:?}"))?;
+                    applied += 1;
+                }
+            }
+            V2LocalDeletion::Deck { name, did } => {
+                let count: i64 = col
+                    .storage
+                    .db()
+                    .query_row("SELECT count(*) FROM cards WHERE did=?", [did], |r| {
+                        r.get(0)
+                    })
+                    .unwrap_or(0);
+                if count == 0 {
+                    col.remove_decks_and_child_decks(&[DeckId(did)])
+                        .map_err(|e| format!("delete deck {name}: {e:?}"))?;
+                    applied += 1;
+                }
+            }
+            V2LocalDeletion::Notetype(ntid) => {
+                let count: i64 = col
+                    .storage
+                    .db()
+                    .query_row("SELECT count(*) FROM notes WHERE mid=?", [ntid], |r| {
+                        r.get(0)
+                    })
+                    .unwrap_or(0);
+                if count == 0 {
+                    col.remove_notetype(NotetypeId(ntid))
+                        .map_err(|e| format!("delete notetype {ntid}: {e:?}"))?;
+                    applied += 1;
+                }
+            }
+            V2LocalDeletion::Media(filename) => {
+                let path = std::path::Path::new(media_folder).join(&filename);
+                if path.is_file() {
+                    std::fs::remove_file(&path)
+                        .map_err(|e| format!("delete media {filename}: {e}"))?;
+                    applied += 1;
+                }
+            }
+        }
+    }
+    Ok(applied)
+}
+
+fn safe_media_name(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename != "."
+        && filename != ".."
+        && !filename.contains('/')
+        && !filename.contains('\\')
+}
+
+fn v2_checksum_parts(parts: &[Value]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(serde_json::to_vec(part).unwrap_or_default());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn v2_note_checksum(fields: &[String], tags: &[String]) -> String {
+    v2_checksum_parts(&[json!(fields), json!(tags)])
+}
+
+fn normalize_v2_deck_config(value: &Value) -> Value {
+    let mut object = value.as_object().cloned().unwrap_or_default();
+    for key in [
+        "id",
+        "mod",
+        "usn",
+        "name",
+        "newToday",
+        "revToday",
+        "lrnToday",
+        "timeToday",
+    ] {
+        object.remove(key);
+    }
+    Value::Object(object)
+}
+
+fn normalize_v2_notetype_definition(value: &Value) -> Value {
+    let mut object = value.as_object().cloned().unwrap_or_default();
+    for key in ["id", "mod", "usn"] {
+        object.remove(key);
+    }
+    for key in ["flds", "tmpls"] {
+        if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(item) = item.as_object_mut() {
+                    item.remove("id");
+                }
+            }
+        }
+    }
+    Value::Object(object)
+}
+
+fn local_v2_notetype_checksums(col: &mut Collection) -> Result<HashMap<i64, String>, String> {
+    let entries = col
+        .get_notetype_names()
+        .map_err(|e| format!("list notetypes: {e:?}"))?
+        .entries;
+    let mut checksums = HashMap::new();
+    for entry in entries {
+        let raw = col
+            .get_notetype_legacy(anki_proto::notetypes::NotetypeId { ntid: entry.id })
+            .map_err(|e| format!("export notetype {}: {e:?}", entry.id))?;
+        let value: Value = serde_json::from_slice(&raw.json)
+            .map_err(|e| format!("decode notetype {}: {e}", entry.id))?;
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&entry.name);
+        let definition = normalize_v2_notetype_definition(&value);
+        checksums.insert(entry.id, v2_checksum_parts(&[json!(name), definition]));
+    }
+    Ok(checksums)
+}
+
+fn local_v2_deck_checksums(col: &mut Collection) -> Result<HashMap<String, String>, String> {
+    let decks = col
+        .get_all_deck_names(false)
+        .map_err(|e| format!("list decks: {e:?}"))?;
+    let mut checksums = HashMap::new();
+    for (did, name) in decks {
+        let raw = col
+            .get_deck_legacy(anki_proto::decks::DeckId { did: did.0 })
+            .map_err(|e| format!("export deck {name}: {e:?}"))?;
+        let value: Value =
+            serde_json::from_slice(&raw.json).map_err(|e| format!("decode deck {name}: {e}"))?;
+        let config = normalize_v2_deck_config(&value);
+        checksums.insert(name, v2_checksum_parts(&[config]));
+    }
+    Ok(checksums)
+}
+
+fn json_i64(value: Option<&Value>) -> i64 {
+    value
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .unwrap_or(0)
+}
+
+fn v2_notetype_payload(col: &mut Collection, ntid: i64) -> Result<Value, String> {
+    let raw = col
+        .get_notetype_legacy(anki_proto::notetypes::NotetypeId { ntid })
+        .map_err(|e| format!("export notetype {ntid}: {e:?}"))?;
+    let value: Value =
+        serde_json::from_slice(&raw.json).map_err(|e| format!("decode notetype {ntid}: {e}"))?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("Mobile Notetype");
+    Ok(json!({
+        "notetype_id": ntid,
+        "name": name,
+        "definition": normalize_v2_notetype_definition(&value),
+        "client_modified_at": rfc3339_from_secs(json_i64(value.get("mod"))),
+        "base_checksum": "",
+    }))
+}
+
+fn v2_deck_payload(col: &mut Collection, name: &str) -> Result<Value, String> {
+    let did =
+        deck_id_by_name(col, name)?.ok_or_else(|| format!("local deck disappeared: {name}"))?;
+    let raw = col
+        .get_deck_legacy(anki_proto::decks::DeckId { did: did.0 })
+        .map_err(|e| format!("export deck {name}: {e:?}"))?;
+    let value: Value =
+        serde_json::from_slice(&raw.json).map_err(|e| format!("decode deck {name}: {e}"))?;
+    Ok(json!({
+        "name": name,
+        "config": normalize_v2_deck_config(&value),
+        "client_modified_at": rfc3339_from_secs(json_i64(value.get("mod"))),
+        "base_checksum": "",
+    }))
+}
+
+fn prepare_v2_notetype_slot(
+    col: &mut Collection,
+    server_id: i64,
+    server_name: &str,
+    previously_known: bool,
+    force_server: bool,
+) -> Result<(), String> {
+    // A brand-new Anki collection comes with unused stock notetypes whose IDs
+    // are generated locally. They can collide with a server ID/name while
+    // representing a different stock model (Basic vs Basic+). Remove only
+    // UNUSED collisions before preserving the canonical server ID.
+    let entries = col
+        .get_notetype_names()
+        .map_err(|e| format!("list notetypes before apply: {e:?}"))?
+        .entries;
+    let mut removals = HashSet::new();
+    for entry in entries {
+        if entry.id != server_id && entry.name != server_name {
+            continue;
+        }
+        let count: i64 = col
+            .storage
+            .db()
+            .query_row("SELECT count(*) FROM notes WHERE mid=?", [entry.id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        if count == 0 {
+            removals.insert(entry.id);
+        } else if entry.id != server_id || (!previously_known && !force_server) {
+            return Err(format!(
+                "KELMA_CONTENT_CONFIRM:notetype {server_name} conflicts with local notes"
+            ));
+        }
+    }
+    for ntid in removals {
+        col.remove_notetype(NotetypeId(ntid))
+            .map_err(|e| format!("remove unused notetype collision {ntid}: {e:?}"))?;
+    }
+    Ok(())
+}
+
+fn apply_v2_deck(col: &mut Collection, record: &Value) -> Result<bool, String> {
+    let name = record
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("Default");
+    let created = ensure_deck(col, name)?;
+    let did = deck_id_by_name(col, name)?.unwrap_or(DeckId(1));
+    let mut value = record
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let modified = record
+        .get("client_modified_at")
+        .or_else(|| record.get("modified_at"))
+        .and_then(Value::as_str)
+        .and_then(rfc3339_to_secs)
+        .unwrap_or(0);
+    value.insert("id".to_string(), json!(did.0));
+    value.insert("name".to_string(), json!(name));
+    value.insert("mod".to_string(), json!(modified));
+    value.insert("usn".to_string(), json!(0));
+    value.entry("newToday".to_string()).or_insert(json!([0, 0]));
+    value.entry("revToday".to_string()).or_insert(json!([0, 0]));
+    value.entry("lrnToday".to_string()).or_insert(json!([0, 0]));
+    value
+        .entry("timeToday".to_string())
+        .or_insert(json!([0, 0]));
+    value.entry("collapsed".to_string()).or_insert(json!(false));
+    value
+        .entry("browserCollapsed".to_string())
+        .or_insert(json!(false));
+    value.entry("dyn".to_string()).or_insert(json!(0));
+    value.entry("conf".to_string()).or_insert(json!(1));
+    let deck = serde_json::to_vec(&Value::Object(value))
+        .map_err(|e| format!("encode deck {name}: {e}"))?;
+    let _ = col
+        .add_or_update_deck_legacy(anki_proto::decks::AddOrUpdateDeckLegacyRequest {
+            deck,
+            preserve_usn_and_mtime: true,
+        })
+        .map_err(|e| format!("apply deck {name}: {e:?}"))?;
+    Ok(created)
+}
+
+fn ensure_v2_batch_without_conflicts(
+    response: &Value,
+    resource: &str,
+    expected: usize,
+) -> Result<(), String> {
+    let conflicts = response
+        .get("conflicts")
+        .and_then(|v| v.get(resource))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let accepted = response
+        .get("accepted")
+        .and_then(|v| v.get(resource))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    if conflicts > 0 {
+        return Err(format!(
+            "KELMA_CONTENT_CONFIRM:{conflicts} {resource} conflict(s)"
+        ));
+    }
+    if accepted != expected {
+        return Err(format!(
+            "server accepted {accepted}/{expected} {resource}; keeping local changes pending"
+        ));
+    }
+    Ok(())
+}
+
 fn v2_json(
     method: &str,
     endpoint: &str,
@@ -2543,12 +3836,11 @@ fn v2_json(
         let mut req = match method {
             "GET" => client.get(&url),
             "POST" => client.post(&url),
+            "PUT" => client.put(&url),
+            "DELETE" => client.delete(&url),
             other => return Err(format!("unsupported v2 method {other}")),
         }
-        .header(
-            "user-agent",
-            format!("kelma-mobile:{}", crate::ANKI_VERSION),
-        );
+        .header("user-agent", kelma_client_label());
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -2578,25 +3870,56 @@ fn v2_json(
 /// Canonical structural checksum for a card. Scheduling is deliberately not
 /// included because due values are collection-relative.
 fn v2_card_checksum(guid: &str, deck_name: &str, ord: i64) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for part in [json!(guid), json!(deck_name), json!(ord)] {
-        hasher.update(serde_json::to_vec(&part).unwrap_or_default());
-        hasher.update(b"\n");
-    }
-    let digest = hasher.finalize();
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
+    v2_checksum_parts(&[json!(guid), json!(deck_name), json!(ord)])
 }
 
-/// Compare RFC3339 values at whole-second precision. Server values are UTC;
-/// fractional seconds are irrelevant because Anki stores card mods as seconds.
-fn rfc3339_second_key(value: &str) -> &str {
-    value.get(..19).unwrap_or(value)
+/// Parse RFC3339 timestamps (including explicit offsets) without adding a
+/// second date/time dependency to the native bridge.
+fn rfc3339_to_secs(value: &str) -> Option<i64> {
+    if value.len() < 19 {
+        return None;
+    }
+    let year = value.get(0..4)?.parse::<i64>().ok()?;
+    let month = value.get(5..7)?.parse::<i64>().ok()?;
+    let day = value.get(8..10)?.parse::<i64>().ok()?;
+    let hour = value.get(11..13)?.parse::<i64>().ok()?;
+    let minute = value.get(14..16)?.parse::<i64>().ok()?;
+    let second = value.get(17..19)?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146097 + day_of_era - 719468;
+    let mut secs = days * 86400 + hour * 3600 + minute * 60 + second;
+
+    let timezone = &value[19..];
+    let offset_start = timezone.find('+').or_else(|| timezone.find('-'));
+    if let Some(index) = offset_start {
+        let sign = if timezone.as_bytes().get(index) == Some(&b'-') {
+            -1
+        } else {
+            1
+        };
+        let offset = &timezone[index + 1..];
+        let offset_hour = offset.get(0..2)?.parse::<i64>().ok()?;
+        let offset_minute = offset.get(3..5)?.parse::<i64>().ok()?;
+        secs -= sign * (offset_hour * 3600 + offset_minute * 60);
+    }
+    Some(secs.max(0))
 }
 
 /// Format a unix-seconds timestamp as an RFC3339 UTC string, matching the
@@ -2623,37 +3946,180 @@ fn rfc3339_from_secs(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+fn referenced_v2_media(col: &mut Collection) -> Result<HashSet<String>, String> {
+    let db = col.storage.db();
+    let image = regex::Regex::new(r#"(?i)<img\b[^>]*\bsrc=["']([^"']+)["']"#)
+        .map_err(|e| format!("image media regex: {e}"))?;
+    let sound =
+        regex::Regex::new(r"\[sound:([^\]]+)\]").map_err(|e| format!("sound media regex: {e}"))?;
+    let mut statement = db
+        .prepare("SELECT flds FROM notes")
+        .map_err(|e| format!("prepare media note scan: {e}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("scan media notes: {e}"))?;
+    let mut names = HashSet::new();
+    for fields in rows.filter_map(Result::ok) {
+        for captures in image
+            .captures_iter(&fields)
+            .chain(sound.captures_iter(&fields))
+        {
+            let name = captures
+                .get(1)
+                .map(|m| m.as_str().trim().replace("%20", " "))
+                .unwrap_or_default();
+            if safe_media_name(&name)
+                && !name.starts_with("http://")
+                && !name.starts_with("https://")
+                && !name.starts_with("data:")
+            {
+                names.insert(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn v2_media_manifest(manifest: &Value, refs: &HashSet<String>) -> HashMap<String, String> {
+    manifest
+        .get("media")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("filename")?.as_str()?;
+            if !refs.contains(name) || !safe_media_name(name) {
+                return None;
+            }
+            Some((
+                name.to_string(),
+                entry
+                    .get("modified_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
 fn v2_sync_media_downloads(
     endpoint: &str,
     token: &str,
+    collection_path: &str,
     media_folder: &str,
+    refs: HashSet<String>,
     progress: Option<Arc<Mutex<V2MediaProgress>>>,
 ) -> Result<usize, String> {
     std::fs::create_dir_all(media_folder).map_err(|e| format!("create media dir: {e}"))?;
-    let manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
-    let mut checked = 0usize;
-    let mut missing = Vec::new();
-    for filename in manifest
-        .get("media")
-        .and_then(Value::as_array)
+    let mut state = load_v2_sync_state(collection_path);
+    let mut manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
+    let mut server_media = v2_media_manifest(&manifest, &refs);
+    let root = std::path::Path::new(media_folder);
+    let uploads = refs
+        .iter()
+        .filter(|name| !server_media.contains_key(*name) && root.join(name).is_file())
         .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|m| {
-            m.get("filename")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-    {
-        if filename.contains('/') || filename.contains('\\') || filename == "." || filename == ".."
-        {
-            checked += 1;
-            continue;
+        .collect::<Vec<_>>();
+
+    let endpoint_owned = endpoint.trim_end_matches('/').to_string();
+    let token_owned = token.to_string();
+    let media_folder_owned = media_folder.to_string();
+    let upload_progress = progress.clone();
+    let uploaded_names = block_on(async move {
+        let client = web_client();
+        let mut names = uploads.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+        let spawn_upload = |tasks: &mut tokio::task::JoinSet<Result<String, String>>,
+                            filename: String| {
+            let client = client.clone();
+            let endpoint = endpoint_owned.clone();
+            let token = token_owned.clone();
+            let media_folder = media_folder_owned.clone();
+            tasks.spawn(async move {
+                let bytes = std::fs::read(std::path::Path::new(&media_folder).join(&filename))
+                    .map_err(|e| format!("read media {filename}: {e}"))?;
+                let path = format!("/v2/media/{}", urlencode(&filename));
+                let mut last_error = String::new();
+                for attempt in 0..3 {
+                    match client
+                        .put(format!("{endpoint}{path}"))
+                        .bearer_auth(&token)
+                        .header("content-type", "application/octet-stream")
+                        .header("user-agent", kelma_client_label())
+                        .body(bytes.clone())
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => return Ok(filename),
+                        Ok(response) => {
+                            let status = response.status();
+                            let text = response.text().await.unwrap_or_default();
+                            last_error = format!("v2 media {path} failed ({status}): {text}");
+                        }
+                        Err(error) => last_error = format!("v2 media upload {path}: {error}"),
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1)))
+                            .await;
+                    }
+                }
+                Err(last_error)
+            });
+        };
+        for filename in names.by_ref().take(50) {
+            spawn_upload(&mut tasks, filename);
         }
-        if std::path::Path::new(media_folder).join(&filename).exists() {
+        let mut uploaded = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            uploaded.push(joined.map_err(|e| format!("media upload task failed: {e}"))??);
+            if let Some(cell) = &upload_progress {
+                if let Ok(mut p) = cell.lock() {
+                    p.uploaded_files = uploaded.len();
+                }
+            }
+            if let Some(filename) = names.next() {
+                spawn_upload(&mut tasks, filename);
+            }
+        }
+        Ok::<_, String>(uploaded)
+    })?;
+
+    // Upload responses do not include modified_at. Refresh once so the local
+    // media baseline records the exact server version.
+    if !uploaded_names.is_empty() {
+        manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
+        server_media = v2_media_manifest(&manifest, &refs);
+    }
+    let uploaded_names = uploaded_names.into_iter().collect::<HashSet<_>>();
+    let mut checked = 0usize;
+    let mut downloads = Vec::<(String, String)>::new();
+    for name in &refs {
+        let Some(server_modified) = server_media.get(name) else {
+            checked += 1; // referenced but absent both locally/server-side
+            continue;
+        };
+        let path = root.join(name);
+        if uploaded_names.contains(name) {
+            state
+                .downloaded_media
+                .insert(name.clone(), server_modified.clone());
             checked += 1;
+        } else if path.is_file() {
+            match state.downloaded_media.get(name) {
+                Some(local_version) if local_version == server_modified => checked += 1,
+                None => {
+                    // Migration from builds without media version tracking: an
+                    // existing file is assumed to be the current server copy.
+                    state
+                        .downloaded_media
+                        .insert(name.clone(), server_modified.clone());
+                    checked += 1;
+                }
+                Some(_) => downloads.push((name.clone(), server_modified.clone())),
+            }
         } else {
-            missing.push(filename);
+            downloads.push((name.clone(), server_modified.clone()));
         }
     }
     if let Some(cell) = &progress {
@@ -2662,73 +4128,98 @@ fn v2_sync_media_downloads(
         }
     }
 
-    let endpoint = endpoint.trim_end_matches('/').to_string();
-    let token = token.to_string();
-    let media_folder = media_folder.to_string();
-    let progress_for_tasks = progress.clone();
-    block_on(async move {
+    let endpoint_owned = endpoint.trim_end_matches('/').to_string();
+    let token_owned = token.to_string();
+    let media_folder_owned = media_folder.to_string();
+    let download_progress = progress.clone();
+    let (downloaded, downloaded_versions) = block_on(async move {
         let client = web_client();
-        let mut names = missing.into_iter();
+        let mut entries = downloads.into_iter();
         let mut tasks = tokio::task::JoinSet::new();
-
-        let spawn_download = |tasks: &mut tokio::task::JoinSet<Result<bool, String>>,
-                              filename: String| {
+        let spawn_download = |tasks: &mut tokio::task::JoinSet<
+            Result<Option<(String, String)>, String>,
+        >,
+                              entry: (String, String)| {
             let client = client.clone();
-            let endpoint = endpoint.clone();
-            let token = token.clone();
-            let media_folder = media_folder.clone();
+            let endpoint = endpoint_owned.clone();
+            let token = token_owned.clone();
+            let media_folder = media_folder_owned.clone();
             tasks.spawn(async move {
+                let (filename, modified) = entry;
                 let path = format!("/v2/media/{}", urlencode(&filename));
-                let response = client
-                    .get(format!("{endpoint}{path}"))
-                    .bearer_auth(token)
-                    .header(
-                        "user-agent",
-                        format!("kelma-mobile:{}", crate::ANKI_VERSION),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| format!("v2 media request {path}: {e}"))?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(false);
+                let mut last_error = String::new();
+                for attempt in 0..3 {
+                    match client
+                        .get(format!("{endpoint}{path}"))
+                        .bearer_auth(&token)
+                        .header("user-agent", kelma_client_label())
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                            return Ok(None)
+                        }
+                        Ok(response) if response.status().is_success() => {
+                            let bytes = response
+                                .bytes()
+                                .await
+                                .map_err(|e| format!("v2 media bytes {path}: {e}"))?;
+                            let target = std::path::Path::new(&media_folder).join(&filename);
+                            let temporary = std::path::Path::new(&media_folder)
+                                .join(format!(".{filename}.kelma-download"));
+                            std::fs::write(&temporary, bytes)
+                                .map_err(|e| format!("write media {filename}: {e}"))?;
+                            std::fs::rename(&temporary, &target)
+                                .map_err(|e| format!("install media {filename}: {e}"))?;
+                            return Ok(Some((filename, modified)));
+                        }
+                        Ok(response) => {
+                            let status = response.status();
+                            let text = response.text().await.unwrap_or_default();
+                            last_error = format!("v2 media {path} failed ({status}): {text}");
+                        }
+                        Err(error) => last_error = format!("v2 media request {path}: {error}"),
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1)))
+                            .await;
+                    }
                 }
-                let status = response.status();
-                if !status.is_success() {
-                    let text = response.text().await.unwrap_or_default();
-                    return Err(format!("v2 media {path} failed ({status}): {text}"));
-                }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("v2 media bytes {path}: {e}"))?;
-                std::fs::write(std::path::Path::new(&media_folder).join(&filename), bytes)
-                    .map_err(|e| format!("write media {filename}: {e}"))?;
-                Ok(true)
+                Err(last_error)
             });
         };
-
-        for filename in names.by_ref().take(50) {
-            spawn_download(&mut tasks, filename);
+        for entry in entries.by_ref().take(50) {
+            spawn_download(&mut tasks, entry);
         }
-        let mut downloaded = 0usize;
+        let mut versions = Vec::new();
         while let Some(joined) = tasks.join_next().await {
-            let did_download = joined.map_err(|e| format!("media download task failed: {e}"))??;
-            if did_download {
-                downloaded += 1;
+            if let Some(version) =
+                joined.map_err(|e| format!("media download task failed: {e}"))??
+            {
+                versions.push(version);
             }
             checked += 1;
-            if let Some(cell) = &progress_for_tasks {
+            if let Some(cell) = &download_progress {
                 if let Ok(mut p) = cell.lock() {
                     p.checked = checked;
-                    p.downloaded_files = downloaded;
+                    p.downloaded_files = versions.len();
                 }
             }
-            if let Some(filename) = names.next() {
-                spawn_download(&mut tasks, filename);
+            if let Some(entry) = entries.next() {
+                spawn_download(&mut tasks, entry);
             }
         }
-        Ok(downloaded)
-    })
+        Ok::<_, String>((versions.len(), versions))
+    })?;
+    for (name, modified) in downloaded_versions {
+        state.downloaded_media.insert(name, modified);
+    }
+    state.media = server_media.keys().cloned().collect();
+    state
+        .downloaded_media
+        .retain(|name, _| server_media.contains_key(name));
+    save_existing_v2_sync_state(collection_path, &state)?;
+    Ok(downloaded)
 }
 
 fn deck_id_by_name(col: &mut Collection, name: &str) -> Result<Option<DeckId>, String> {
@@ -2790,7 +4281,7 @@ fn inspect_header(hkey: &str) -> String {
     json!({
         "v": 11,
         "k": hkey,
-        "c": format!("kelma-mobile:{}", crate::ANKI_VERSION),
+        "c": kelma_client_label(),
         "s": "",
     })
     .to_string()
@@ -3115,4 +4606,334 @@ fn graphs_to_json(deck_name: &str, days: u32, g: &anki_proto::stats::GraphsRespo
     }
 
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    #[test]
+    fn note_checksum_matches_canonical_hasher() {
+        assert_eq!(
+            v2_note_checksum(&["a".to_string(), "b".to_string()], &["x".to_string()]),
+            "a148b9a3db29df2e6dd510b634c61765701e2c0795bb900e9ab07b035988c16f"
+        );
+    }
+
+    #[test]
+    fn rfc3339_round_trip() {
+        for seconds in [0, 1, 1_720_656_789, 1_783_820_000] {
+            let encoded = rfc3339_from_secs(seconds);
+            assert_eq!(rfc3339_to_secs(&encoded), Some(seconds));
+        }
+        assert_eq!(
+            rfc3339_to_secs("2026-07-12T01:02:03.123456Z"),
+            rfc3339_to_secs("2026-07-12T01:02:03Z")
+        );
+    }
+
+    #[test]
+    fn normalizes_volatile_metadata() {
+        let deck = normalize_v2_deck_config(&json!({
+            "id": 123, "name": "Test", "mod": 456, "usn": -1,
+            "newToday": [1, 2], "dyn": 0, "conf": 1
+        }));
+        assert_eq!(deck, json!({ "dyn": 0, "conf": 1 }));
+        let notetype = normalize_v2_notetype_definition(&json!({
+            "id": 123, "mod": 456, "usn": -1, "name": "Basic",
+            "flds": [{"name": "Front", "id": 99}],
+            "tmpls": [{"name": "Card 1", "id": 100}]
+        }));
+        assert_eq!(
+            notetype,
+            json!({
+                "name": "Basic",
+                "flds": [{"name": "Front"}],
+                "tmpls": [{"name": "Card 1"}]
+            })
+        );
+    }
+
+    fn test_session(root: &std::path::Path, name: &str) -> Box<KelmaSession> {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        KelmaSession::open(&json!({
+            "collectionPath": dir.join("collection.anki2").to_string_lossy(),
+            "mediaFolderPath": dir.join("collection.media").to_string_lossy(),
+            "mediaDbPath": dir.join("collection.media.db2").to_string_lossy(),
+            "timeZone": "UTC",
+        }))
+        .unwrap()
+    }
+
+    /// Full native-v2 regression against the local isolated server user. Run:
+    /// `cargo test --manifest-path rust/kelma-core/Cargo.toml -- --ignored`
+    #[test]
+    #[ignore = "requires the local v2 server on localhost:8081"]
+    fn native_v2_fresh_pull_updates_scheduling_and_tombstones() {
+        let endpoint = "http://localhost:8081";
+        let unique = format!(
+            "ios-e2e-{}-{}",
+            std::process::id(),
+            TimestampMillis::now().0
+        );
+        let password = "ios-native-v2-test";
+        v2_json(
+            "POST",
+            endpoint,
+            "/v2/auth/register",
+            None,
+            Some(json!({ "username": unique, "password": password })),
+        )
+        .unwrap();
+        let login = v2_json(
+            "POST",
+            endpoint,
+            "/v2/auth/login",
+            None,
+            Some(json!({
+                "username": unique,
+                "password": password,
+                "client_label": "kelma-ios-e2e"
+            })),
+        )
+        .unwrap();
+        let token = login.get("token").and_then(Value::as_str).unwrap();
+        let auth = json!({ "hkey": token, "endpoint": endpoint });
+
+        let root = std::env::temp_dir().join(format!("kelma-ios-v2-{unique}"));
+        let source = test_session(&root, "source");
+        let target = test_session(&root, "target");
+        let ntid = source.notetypes().unwrap()["notetypes"][0]["id"]
+            .as_i64()
+            .unwrap();
+        let added = source
+            .add_note(&json!({
+                "notetypeId": ntid,
+                "deckId": 1,
+                "fields": ["mobile front [sound:ios-e2e.mp3]", "mobile back"],
+                "tags": ["ios-e2e"]
+            }))
+            .unwrap();
+        let source_nid = added["noteId"].as_i64().unwrap();
+        let source_media = root.join("source/collection.media/ios-e2e.mp3");
+        std::fs::create_dir_all(source_media.parent().unwrap()).unwrap();
+        std::fs::write(&source_media, b"mobile-media-v1").unwrap();
+
+        source.sync_collection(&auth).unwrap();
+        source.sync_media(&auth).unwrap();
+        target.sync_collection(&auth).unwrap();
+        target.sync_media(&auth).unwrap();
+        let target_media = root.join("target/collection.media/ios-e2e.mp3");
+        assert_eq!(std::fs::read(&target_media).unwrap(), b"mobile-media-v1");
+        let stable = target.sync_collection(&auth).unwrap();
+        assert_eq!(
+            stable["required"], "noChanges",
+            "{}",
+            stable["serverMessage"]
+        );
+
+        // Same-name server replacements must invalidate the downloaded-media
+        // baseline and overwrite the stale local file.
+        let response = block_on(async {
+            web_client()
+                .put(format!("{endpoint}/v2/media/ios-e2e.mp3"))
+                .bearer_auth(token)
+                .header("content-type", "application/octet-stream")
+                .body(b"mobile-media-v2".to_vec())
+                .send()
+                .await
+        })
+        .unwrap();
+        assert!(response.status().is_success());
+        target.sync_media(&auth).unwrap();
+        assert_eq!(std::fs::read(&target_media).unwrap(), b"mobile-media-v2");
+        let (target_nid, guid, fields): (i64, String, String) = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row(
+                        "SELECT id, guid, flds FROM notes WHERE tags LIKE '%ios-e2e%'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(!guid.is_empty());
+        assert!(fields.contains("mobile front"));
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        source
+            .update_note(&json!({
+                "noteId": source_nid,
+                "notetypeId": ntid,
+                "fields": ["updated on iOS", "mobile back"],
+                "tags": ["ios-e2e"]
+            }))
+            .unwrap();
+        source.sync_collection(&auth).unwrap();
+        target.sync_collection(&auth).unwrap();
+        let updated: String = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT flds FROM notes WHERE id=?", [target_nid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(updated.starts_with("updated on iOS"));
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        source
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .execute("UPDATE col SET crt=crt-(5*86400)", [])
+                    .map_err(|e| e.to_string())?;
+                col.storage
+                    .db()
+                    .execute(
+                        "UPDATE cards SET type=2, queue=2, due=30, mod=?, usn=-1 WHERE nid=?",
+                        (TimestampSecs::now().0, source_nid),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        source.sync_collection(&auth).unwrap();
+        target.sync_collection(&auth).unwrap();
+        let source_due: i64 = source
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT due FROM cards WHERE nid=?", [source_nid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let target_due: i64 = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT due FROM cards WHERE nid=?", [target_nid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let source_crt: i64 = source
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT crt FROM col", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let target_crt: i64 = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT crt FROM col", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(
+            source_crt / 86400 + source_due,
+            target_crt / 86400 + target_due
+        );
+
+        // A deletion authored on Mobile is persisted as an outgoing tombstone,
+        // uploaded on the next sync, and removed from another device.
+        let delete_note = source
+            .add_note(&json!({
+                "notetypeId": ntid,
+                "deckId": 1,
+                "fields": ["delete me", "mobile tombstone"],
+                "tags": ["ios-delete-e2e"]
+            }))
+            .unwrap();
+        let delete_source_nid = delete_note["noteId"].as_i64().unwrap();
+        source.sync_collection(&auth).unwrap();
+        target.sync_collection(&auth).unwrap();
+        let delete_target_card: i64 = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row(
+                        "SELECT c.id FROM cards c JOIN notes n ON n.id=c.nid WHERE n.tags LIKE '%ios-delete-e2e%'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        target
+            .delete_card(&json!({ "cardId": delete_target_card }))
+            .unwrap();
+        target.sync_collection(&auth).unwrap();
+        source.sync_collection(&auth).unwrap();
+        let source_deleted: i64 = source
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row(
+                        "SELECT count(*) FROM notes WHERE id=?",
+                        [delete_source_nid],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(source_deleted, 0);
+
+        // A local review against server-deleted data requires explicit one-sync
+        // approval; no device work is discarded silently.
+        target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .execute(
+                        "UPDATE cards SET due=due+1, mod=?, usn=-1 WHERE nid=?",
+                        (TimestampSecs::now().0, target_nid),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        v2_json(
+            "DELETE",
+            endpoint,
+            &format!("/v2/notes/{}", urlencode(&guid)),
+            Some(token),
+            None,
+        )
+        .unwrap();
+        let blocked = target.sync_collection(&auth).unwrap_err();
+        assert!(blocked.contains("KELMA_DELETION_CONFIRM:"));
+        let approved = json!({
+            "hkey": token,
+            "endpoint": endpoint,
+            "allowDeletions": true,
+        });
+        target.sync_collection(&approved).unwrap();
+        let remaining: i64 = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT count(*) FROM notes WHERE id=?", [target_nid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

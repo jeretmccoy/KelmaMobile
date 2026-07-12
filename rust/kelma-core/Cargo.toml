@@ -1,6 +1,6 @@
 [package]
 name = "kelma_core"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 publish = false
@@ -21,5 +21,6 @@ url = "2"
 # `Collection::normal_sync`/`full_upload`/`full_download` will be a different
 # type. Keep these pinned in lockstep with the vendored Anki submodule.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+regex = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 

@@ -18,20 +18,23 @@ jest.mock('../core/KelmaCore', () => ({
   answerCard: jest.fn(),
   getMediaDir: jest.fn().mockResolvedValue('/data/media'),
   getNextCard: jest.fn(),
+  getUndoStatus: jest.fn().mockResolvedValue({ available: false, label: '' }),
+  undo: jest.fn(),
+  writeCardHtml: jest.fn().mockResolvedValue({ uri: 'file:///tmp/card.html' }),
   Rating: { Again: 0, Hard: 1, Good: 2, Easy: 3 },
 }));
 
 import React from 'react';
-import { ScrollView } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { audioPlayer } from '../audio/AudioPlayer';
-import { getMediaDir, getNextCard } from '../core/KelmaCore';
+import { getMediaDir, getNextCard, writeCardHtml } from '../core/KelmaCore';
 import { ReviewerScreen } from './ReviewerScreen';
 
 const play = audioPlayer.play as jest.Mock;
 const stop = audioPlayer.stop as jest.Mock;
 const getMediaDirMock = getMediaDir as jest.Mock;
 const getNextCardMock = getNextCard as jest.Mock;
+const writeCardHtmlMock = writeCardHtml as jest.Mock;
 
 const cardWith = (question: string, answer: string) => ({
   cardId: 1,
@@ -47,6 +50,11 @@ beforeEach(() => {
   getMediaDirMock.mockReset();
   getMediaDirMock.mockResolvedValue('/data/media');
   getNextCardMock.mockReset();
+  writeCardHtmlMock.mockReset();
+  writeCardHtmlMock.mockResolvedValue({
+    uri: 'file:///tmp/card.html',
+    allowedRoot: '/tmp',
+  });
 });
 
 describe('ReviewerScreen audio', () => {
@@ -76,10 +84,9 @@ describe('ReviewerScreen audio', () => {
     const json = JSON.stringify(renderer!.toJSON());
     expect(json).not.toContain('audio1.mp3');
     expect(json).not.toContain('audio2.mp3');
-    expect(json).toContain('▶');
-    expect(renderer!.root.findByType(ScrollView).props.alwaysBounceVertical).toBe(
-      true,
-    );
+    const writtenHtml = writeCardHtmlMock.mock.calls.at(-1)?.[0] as string;
+    expect(writtenHtml).toContain('class="kelma-audio"');
+    expect(writtenHtml).toContain('&#9654;');
   });
 
   it('waits for the media directory before autoplaying', async () => {

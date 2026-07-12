@@ -8,8 +8,7 @@ use std::{
     ffi::CStr,
     os::raw::c_char,
     panic::{catch_unwind, AssertUnwindSafe},
-    ptr,
-    slice,
+    ptr, slice,
 };
 
 use anki::backend::{init_backend, Backend};
@@ -18,7 +17,6 @@ use prost::Message;
 use serde_json::{json, Value};
 
 use crate::session::KelmaSession;
-
 
 pub const ANKI_VERSION: &str = "25.09.2";
 const ANKI_COMMIT: &str = "3890e12c9e48c028c3f12aa58cb64bd9f8895e30";
@@ -130,10 +128,7 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kelma_backend_open(
-    input: *const u8,
-    input_len: usize,
-) -> KelmaOpenResult {
+pub unsafe extern "C" fn kelma_backend_open(input: *const u8, input_len: usize) -> KelmaOpenResult {
     let input = match input_bytes(input, input_len) {
         Ok(input) => input,
         Err(error) => return KelmaOpenResult::error(STATUS_INVALID_ARGUMENT, error),
@@ -268,8 +263,8 @@ pub unsafe extern "C" fn kelma_session_open(
     };
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let request: Value = serde_json::from_slice(bytes)
-            .map_err(|e| format!("invalid open request JSON: {e}"))?;
+        let request: Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("invalid open request JSON: {e}"))?;
         KelmaSession::open(&request)
     }));
 
@@ -299,7 +294,9 @@ pub unsafe extern "C" fn kelma_session_run(
 
     let op = match CStr::from_ptr(op).to_str() {
         Ok(op) => op.to_owned(),
-        Err(_) => return KelmaResult::error(STATUS_INVALID_ARGUMENT, "operation name is not UTF-8"),
+        Err(_) => {
+            return KelmaResult::error(STATUS_INVALID_ARGUMENT, "operation name is not UTF-8")
+        }
     };
     let bytes = match input_bytes(input, input_len) {
         Ok(bytes) => bytes,
@@ -389,7 +386,6 @@ pub unsafe extern "C" fn kelma_session_close(handle: *mut KelmaSession) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn initializes_the_real_anki_backend() {
