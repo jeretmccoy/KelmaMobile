@@ -1656,7 +1656,7 @@ impl KelmaSession {
             .collect::<Vec<_>>();
 
         let mut pulled_notes = Vec::<Value>::new();
-        for chunk in server_note_guids.chunks(1000) {
+        for chunk in server_note_guids.chunks(3000) {
             let resp = v2_json(
                 "POST",
                 endpoint,
@@ -2068,7 +2068,7 @@ impl KelmaSession {
         let mut pushed_notes = 0usize;
         let mut pushed_cards = 0usize;
         if !note_payloads.is_empty() || !card_payloads.is_empty() {
-            for nchunk in note_payloads.chunks(1000) {
+            for nchunk in note_payloads.chunks(3000) {
                 let resp = v2_json(
                     "POST",
                     endpoint,
