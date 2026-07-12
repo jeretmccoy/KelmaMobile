@@ -1674,7 +1674,7 @@ impl KelmaSession {
             );
         }
         let mut pulled_cards = Vec::<Value>::new();
-        for chunk in server_card_ids.chunks(1000) {
+        for chunk in server_card_ids.chunks(3000) {
             let resp = v2_json(
                 "POST",
                 endpoint,
@@ -2084,7 +2084,7 @@ impl KelmaSession {
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
             }
-            for cchunk in card_payloads.chunks(1000) {
+            for cchunk in card_payloads.chunks(3000) {
                 let resp = v2_json(
                     "POST",
                     endpoint,
