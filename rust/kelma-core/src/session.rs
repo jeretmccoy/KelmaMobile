@@ -5,7 +5,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -1572,13 +1572,48 @@ impl KelmaSession {
 
     fn v2_sync_collection(&self, endpoint: &str, token: &str) -> Result<V2SyncOutcome, String> {
         let manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
+
+        // Build local note identities and structural card hashes with two SQL
+        // scans. Previously every sync downloaded every server card, then ran
+        // one identity query per card even when nothing had changed.
+        let (local_note_guids, local_cards) = self.with_col(|col| {
+            let db = col.storage.db();
+            let mut note_guids = HashSet::new();
+            let mut note_stmt = db.prepare("SELECT guid FROM notes WHERE guid <> ''")?;
+            let note_rows = note_stmt.query_map([], |row| row.get::<_, String>(0))?;
+            note_guids.extend(note_rows.filter_map(Result::ok));
+
+            let mut cards = HashMap::new();
+            let mut card_stmt = db.prepare(
+                "SELECT n.guid, c.ord, d.name, c.mod FROM cards c \
+                 JOIN notes n ON n.id=c.nid JOIN decks d ON d.id=c.did \
+                 WHERE n.guid <> ''",
+            )?;
+            let rows = card_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for (guid, ord, deck, modified) in rows.filter_map(Result::ok) {
+                cards.insert(
+                    format!("{guid}:{ord}"),
+                    (v2_card_checksum(&guid, &deck, ord), rfc3339_from_secs(modified)),
+                );
+            }
+            Ok((note_guids, cards))
+        })?;
+
         let server_note_guids = manifest
             .get("notes")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|n| n.get("guid").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|note| note.get("guid").and_then(Value::as_str).map(str::to_string))
+            .filter(|guid| !local_note_guids.contains(guid))
             .collect::<Vec<_>>();
         let server_card_ids = manifest
             .get("cards")
@@ -1586,7 +1621,22 @@ impl KelmaSession {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|c| c.get("card_id").and_then(Value::as_i64))
+            .filter(|card| {
+                let guid = card.get("note_guid").and_then(Value::as_str).unwrap_or("");
+                let ord = card.get("ord").and_then(Value::as_i64).unwrap_or(0);
+                let key = format!("{guid}:{ord}");
+                let Some((local_checksum, local_modified)) = local_cards.get(&key) else {
+                    return true;
+                };
+                let server_checksum = card.get("checksum").and_then(Value::as_str).unwrap_or("");
+                let server_modified = card
+                    .get("client_modified_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                server_checksum != local_checksum
+                    || rfc3339_second_key(server_modified) > rfc3339_second_key(local_modified)
+            })
+            .filter_map(|card| card.get("card_id").and_then(Value::as_i64))
             .collect::<Vec<_>>();
         let server_notetype_ids = manifest
             .get("notetypes")
@@ -1606,7 +1656,7 @@ impl KelmaSession {
             .collect::<Vec<_>>();
 
         let mut pulled_notes = Vec::<Value>::new();
-        for chunk in server_note_guids.chunks(500) {
+        for chunk in server_note_guids.chunks(1000) {
             let resp = v2_json(
                 "POST",
                 endpoint,
@@ -1624,7 +1674,7 @@ impl KelmaSession {
             );
         }
         let mut pulled_cards = Vec::<Value>::new();
-        for chunk in server_card_ids.chunks(500) {
+        for chunk in server_card_ids.chunks(1000) {
             let resp = v2_json(
                 "POST",
                 endpoint,
@@ -1808,6 +1858,25 @@ impl KelmaSession {
             added_notes += 1;
         }
 
+        // Resolve every logical card identity in one scan instead of one SQL
+        // query per pulled card.
+        let local_card_ids: HashMap<String, i64> = {
+            let db = col.storage.db();
+            let mut stmt = db.prepare(
+                "SELECT n.guid, c.ord, c.id FROM cards c JOIN notes n ON n.id=c.nid WHERE n.guid <> ''",
+            ).map_err(|e| format!("prepare local card identities: {e}"))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }).map_err(|e| format!("query local card identities: {e}"))?;
+            rows.filter_map(Result::ok)
+                .map(|(guid, ord, card_id)| (format!("{guid}:{ord}"), card_id))
+                .collect()
+        };
+
         let mut applied_cards = 0usize;
         for card in &pulled_cards {
             let guid = card.get("note_guid").and_then(Value::as_str).unwrap_or("");
@@ -1815,15 +1884,9 @@ impl KelmaSession {
             if guid.is_empty() {
                 continue;
             }
-            let cid: Option<i64> = col.storage.db()
-                .query_row(
-                    "SELECT c.id FROM cards c JOIN notes n ON n.id = c.nid WHERE n.guid = ? AND c.ord = ? LIMIT 1",
-                    (guid, ord),
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| format!("find local card {guid}:{ord}: {e}"))?;
-            let Some(cid) = cid else { continue };
+            let Some(cid) = local_card_ids.get(&format!("{guid}:{ord}")).copied() else {
+                continue;
+            };
             let deck_name = card
                 .get("deck_name")
                 .and_then(Value::as_str)
@@ -2005,7 +2068,7 @@ impl KelmaSession {
         let mut pushed_notes = 0usize;
         let mut pushed_cards = 0usize;
         if !note_payloads.is_empty() || !card_payloads.is_empty() {
-            for nchunk in note_payloads.chunks(500) {
+            for nchunk in note_payloads.chunks(1000) {
                 let resp = v2_json(
                     "POST",
                     endpoint,
@@ -2021,7 +2084,7 @@ impl KelmaSession {
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize;
             }
-            for cchunk in card_payloads.chunks(500) {
+            for cchunk in card_payloads.chunks(1000) {
                 let resp = v2_json(
                     "POST",
                     endpoint,
@@ -2510,6 +2573,30 @@ fn v2_json(
             serde_json::from_str(&text).map_err(|e| format!("v2 JSON {path}: {e}: {text}"))
         }
     })
+}
+
+/// Canonical structural checksum for a card. Scheduling is deliberately not
+/// included because due values are collection-relative.
+fn v2_card_checksum(guid: &str, deck_name: &str, ord: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [json!(guid), json!(deck_name), json!(ord)] {
+        hasher.update(serde_json::to_vec(&part).unwrap_or_default());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+/// Compare RFC3339 values at whole-second precision. Server values are UTC;
+/// fractional seconds are irrelevant because Anki stores card mods as seconds.
+fn rfc3339_second_key(value: &str) -> &str {
+    value.get(..19).unwrap_or(value)
 }
 
 /// Format a unix-seconds timestamp as an RFC3339 UTC string, matching the
