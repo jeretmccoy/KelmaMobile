@@ -80,22 +80,29 @@ fn kelma_client_label() -> String {
 
 fn web_client() -> reqwest::Client {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::OnceLock;
     use std::time::Duration;
-    reqwest::Client::builder()
-        // Force IPv4. iOS's URLSession (what Safari uses) does Happy Eyeballs —
-        // it races IPv4 and IPv6 and uses whichever connects — but reqwest/hyper
-        // connects to the first resolved address, usually the IPv6 one. On a
-        // network whose IPv6 route to the sync host is a black hole (common on
-        // some carriers / captive Wi-Fi), that connect just hangs until the TCP
-        // timeout (~75s) with no IPv4 fallback, so sync "times out" even though
-        // the same host loads instantly in Safari. Binding a local IPv4 address
-        // makes every sync connection use the A record.
-        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        // And cap connect time so a genuinely dead route fails fast and legibly
-        // instead of a silent ~75s hang.
-        .connect_timeout(Duration::from_secs(20))
-        .build()
-        .expect("failed to build sync HTTP client")
+
+    // One shared client keeps Cloudflare TLS connections pooled across the many
+    // 3,000-row/media requests in a sync. Constructing a fresh client for every
+    // request caused avoidable handshakes and intermittent connection drops on
+    // iOS networks. reqwest::Client clones are cheap shared handles.
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                // Force IPv4. iOS's URLSession (what Safari uses) does Happy
+                // Eyeballs, but reqwest/hyper can otherwise wait on a broken
+                // IPv6 carrier route without falling back promptly.
+                .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                .connect_timeout(Duration::from_secs(20))
+                .tcp_keepalive(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(50)
+                .build()
+                .expect("failed to build sync HTTP client")
+        })
+        .clone()
 }
 
 /// Run a future to completion on a throwaway current-thread runtime. rslib's

@@ -11,7 +11,10 @@
  * (served through Cloudflare → cloudflared tunnel → Go server on bev). Override
  * per-user once a settings screen exists.
  */
-export const DEFAULT_SYNC_ENDPOINT = 'https://sync2.ankiai.tech';
+export const DEFAULT_SYNC_ENDPOINT = 'https://sync2.kelma.tech';
+
+/** Previous production aliases that reach the same token/database service. */
+export const LEGACY_SYNC_ENDPOINTS = ['https://sync2.ankiai.tech'] as const;
 
 
 /**
@@ -25,7 +28,7 @@ export const KELMA_SIGNUP_URL = 'https://kelma.tech';
  * The client version string reported to the sync server. Tracks the pinned
  * Anki/rslib core so the server can apply protocol compatibility rules.
  */
-export const SYNC_CLIENT_VERSION = 'kelma-mobile,1.1.0,anki25.09.2';
+export const SYNC_CLIENT_VERSION = 'kelma-mobile,1.1.1,anki25.09.2';
 
 /** Identifier of the active profile (single-profile for now). */
 export const DEFAULT_PROFILE_ID = 'default';

@@ -479,12 +479,14 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
           <Text style={styles.title}>Sync</Text>
         </View>
         <Text style={styles.intro}>
-          Sync cards, scheduling data, images, and audio through Anki’s Rust
-          sync protocol.
+          Sync cards, scheduling data, images, and audio through KelmaSync v2.
         </Text>
 
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>KelmaSync account</Text>
+          <Text style={styles.sectionTitle}>Kelma Immersion account</Text>
+          <Text style={styles.accountHelp}>
+            Use the same email and password you use on kelma.tech. This is not an AnkiWeb login.
+          </Text>
           <Text style={styles.endpoint}>{DEFAULT_SYNC_ENDPOINT}</Text>
 
           {!auth && (
@@ -916,10 +918,16 @@ const styles = StyleSheet.create({
     ...shadow.card,
   },
   sectionTitle: { color: palette.textPrimary, fontSize: 18, fontWeight: '700' },
+  accountHelp: {
+    color: palette.textSecondary,
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 6,
+  },
   endpoint: {
     color: palette.textMuted,
     fontSize: 12,
-    marginTop: 4,
+    marginTop: 6,
     marginBottom: 18,
   },
   signupLink: {

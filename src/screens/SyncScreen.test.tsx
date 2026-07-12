@@ -119,7 +119,7 @@ test('requires one-sync approval before discarding local work on server deletion
         onSynced={jest.fn()}
         onSignedIn={jest.fn()}
         onSignedOut={jest.fn()}
-        initialAuth={{ hkey: 'key', endpoint: 'https://sync2.ankiai.tech' }}
+        initialAuth={{ hkey: 'key', endpoint: 'https://sync2.kelma.tech' }}
       />,
     );
   });

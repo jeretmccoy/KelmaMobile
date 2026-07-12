@@ -36,7 +36,7 @@ On iOS these run through `rust/kelma-core` (the Kelma C ABI over the pinned
 ### Sync
 
 Kelma ships pointed at the production **KelmaSync v2** REST service at
-`https://sync2.ankiai.tech`. The default endpoint lives in
+`https://sync2.kelma.tech`. The default endpoint lives in
 [`src/config.ts`](./src/config.ts) (`DEFAULT_SYNC_ENDPOINT`). Native sync compares
 canonical checksums, transfers notes/cards in 3,000-item batches, converts
 collection-relative due dates, applies tombstones safely, uploads mobile-created

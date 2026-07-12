@@ -10,7 +10,11 @@
 
 import { Platform } from 'react-native';
 import NativeKelmaCore from '../../specs/NativeKelmaCore';
-import { DEFAULT_PROFILE_ID, DEFAULT_SYNC_ENDPOINT } from '../config';
+import {
+  DEFAULT_PROFILE_ID,
+  DEFAULT_SYNC_ENDPOINT,
+  LEGACY_SYNC_ENDPOINTS,
+} from '../config';
 
 export type CoreInfo = {
   ankiVersion: string;
@@ -584,14 +588,22 @@ export async function getPendingChanges(): Promise<PendingChanges> {
  * store), or `null` if the user hasn't signed in. */
 export async function getStoredSyncAuth(): Promise<SyncAuth | null> {
   const result = await runOp<SyncAuth | null>('getSyncAuth');
-  if (result && result.endpoint.replace(/\/$/, '') !== DEFAULT_SYNC_ENDPOINT) {
-    // Tokens are scoped to their issuing server. Invalidate credentials saved
-    // by the localhost/v1 deployment so upgrading users sign in once against
-    // the production v2 endpoint instead of repeatedly failing with a 401.
+  if (!result) return null;
+
+  const endpoint = result.endpoint.replace(/\/$/, '');
+  if ((LEGACY_SYNC_ENDPOINTS as readonly string[]).includes(endpoint)) {
+    // The old ankiai.tech hostname and the canonical kelma.tech hostname reach
+    // the same v2 service/token database. Preserve login while migrating URL.
+    const migrated = { ...result, endpoint: DEFAULT_SYNC_ENDPOINT };
+    await storeSyncAuth(migrated);
+    return migrated;
+  }
+  if (endpoint !== DEFAULT_SYNC_ENDPOINT) {
+    // Localhost/v1 tokens really are from a different service; require login.
     await clearStoredSyncAuth();
     return null;
   }
-  return result ?? null;
+  return result;
 }
 
 /** Persist the KelmaSync host key + endpoint so the home Sync button can sync

@@ -24,6 +24,7 @@ import {
   getDeckTree,
   getMediaDir,
   getNextCard,
+  getStoredSyncAuth,
   openProfile,
   Rating,
   selectDeck,
@@ -124,6 +125,25 @@ describe('sync defaults to KelmaSync', () => {
       JSON.stringify({ username: 'user', password: 'pass', endpoint: DEFAULT_SYNC_ENDPOINT }),
     );
     expect(auth.hkey).toBe('abc');
+  });
+
+  it('migrates the old production hostname without discarding its token', async () => {
+    native.runCollectionOp
+      .mockResolvedValueOnce(
+        JSON.stringify({ hkey: 'abc', endpoint: 'https://sync2.ankiai.tech' }),
+      )
+      .mockResolvedValueOnce('{}');
+
+    await expect(getStoredSyncAuth()).resolves.toEqual({
+      hkey: 'abc',
+      endpoint: DEFAULT_SYNC_ENDPOINT,
+    });
+    expect(native.runCollectionOp).toHaveBeenNthCalledWith(1, 'getSyncAuth', '');
+    expect(native.runCollectionOp).toHaveBeenNthCalledWith(
+      2,
+      'setSyncAuth',
+      JSON.stringify({ hkey: 'abc', endpoint: DEFAULT_SYNC_ENDPOINT }),
+    );
   });
 
   it('passes auth through for a normal sync', async () => {
