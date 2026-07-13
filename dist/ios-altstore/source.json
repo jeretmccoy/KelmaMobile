@@ -12,17 +12,25 @@
       "iconURL": "https://kelma.tech/altstore/icon.png",
       "tintColor": "0D9488",
       "category": "education",
-      "version": "1.1.3",
+      "version": "1.1.4",
       "versionDate": "2026-07-12",
       "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
-      "size": 13581111,
-      "sha256": "e63b85d00773795105662fb1ee3ccbaa5bf92b7d1cf8de9aae46e5cec3067f5b",
+      "size": 13584624,
+      "sha256": "ab02307f9cef87ed3010eda50d6b1a29750d0a41bd7c34d2d71b3c93b91143d5",
       "versions": [
+        {
+          "version": "1.1.4",
+          "date": "2026-07-12",
+          "localizedDescription": "Adds automatic update discovery at startup and a manual Check for updates control. AltStore remains responsible for the verified iOS installation.",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "size": 13584624,
+          "sha256": "ab02307f9cef87ed3010eda50d6b1a29750d0a41bd7c34d2d71b3c93b91143d5"
+        },
         {
           "version": "1.1.3",
           "date": "2026-07-12",
           "localizedDescription": "Fixes Compare with server by moving its deck/note manifest, note detail, Accept server, and Force local actions entirely to KelmaSync v2 instead of removed legacy inspect routes.",
-          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.3.ipa",
           "size": 13581111,
           "sha256": "e63b85d00773795105662fb1ee3ccbaa5bf92b7d1cf8de9aae46e5cec3067f5b"
         },
