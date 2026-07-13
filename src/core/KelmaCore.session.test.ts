@@ -32,6 +32,7 @@ import {
   syncCollection,
   syncLogin,
   syncMedia,
+  syncMediaMonitored,
 } from './KelmaCore';
 import { DEFAULT_SYNC_ENDPOINT } from '../config';
 
@@ -128,6 +129,14 @@ describe('sync defaults to KelmaSync', () => {
     expect(auth.hkey).toBe('abc');
   });
 
+  it('rejects an invalid login payload instead of continuing with undefined credentials', async () => {
+    native.runCollectionOp.mockResolvedValueOnce('{}');
+
+    await expect(syncLogin('user', 'pass')).rejects.toThrow(
+      'invalid sync login response',
+    );
+  });
+
   it('migrates the old production hostname without discarding its token', async () => {
     native.runCollectionOp
       .mockResolvedValueOnce(
@@ -174,6 +183,20 @@ describe('sync defaults to KelmaSync', () => {
       JSON.stringify({ hkey: 'abc', endpoint: DEFAULT_SYNC_ENDPOINT }),
     );
     expect(result).toEqual({ files: 123, bytes: 456789 });
+  });
+
+  it('rejects malformed monitored progress instead of formatting undefined counters', async () => {
+    native.runCollectionOp
+      .mockResolvedValueOnce(JSON.stringify({ started: true }))
+      .mockResolvedValueOnce('{}');
+
+    await expect(
+      syncMediaMonitored(
+        { hkey: 'abc', endpoint: DEFAULT_SYNC_ENDPOINT },
+        jest.fn(),
+        0,
+      ),
+    ).rejects.toThrow('invalid media progress response');
   });
 
   it('resets local v2 content without invoking a server route', async () => {

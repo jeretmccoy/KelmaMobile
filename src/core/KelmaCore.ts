@@ -587,8 +587,9 @@ export async function getPendingChanges(): Promise<PendingChanges> {
 /** Load the persisted KelmaSync credentials (from the collection's config
  * store), or `null` if the user hasn't signed in. */
 export async function getStoredSyncAuth(): Promise<SyncAuth | null> {
-  const result = await runOp<SyncAuth | null>('getSyncAuth');
-  if (!result) return null;
+  const raw = await runOp<unknown>('getSyncAuth');
+  if (raw == null) return null;
+  const result = decodeSyncAuth(raw, 'stored sync credentials');
 
   const endpoint = result.endpoint.replace(/\/$/, '');
   if ((LEGACY_SYNC_ENDPOINTS as readonly string[]).includes(endpoint)) {
@@ -984,12 +985,31 @@ export async function undo(): Promise<UndoResult> {
 
 // --- Sync (KelmaSync by default) --------------------------------------------
 
+function invalidSyncPayload(kind: string): Error {
+  const androidHint =
+    Platform.OS === 'android'
+      ? ' Rebuild the Android app so its native core matches the JavaScript bundle.'
+      : '';
+  return new Error(`The native core returned an invalid ${kind} response.${androidHint}`);
+}
+
+function decodeSyncAuth(value: unknown, kind = 'sync login'): SyncAuth {
+  if (!value || typeof value !== 'object') throw invalidSyncPayload(kind);
+  const auth = value as Partial<SyncAuth>;
+  if (!auth.hkey || typeof auth.hkey !== 'string' || typeof auth.endpoint !== 'string') {
+    throw invalidSyncPayload(kind);
+  }
+  return { hkey: auth.hkey, endpoint: auth.endpoint };
+}
+
 export async function syncLogin(
   username: string,
   password: string,
   endpoint: string = DEFAULT_SYNC_ENDPOINT,
 ): Promise<SyncAuth> {
-  return runOp<SyncAuth>('syncLogin', { username, password, endpoint });
+  return decodeSyncAuth(
+    await runOp<unknown>('syncLogin', { username, password, endpoint }),
+  );
 }
 
 export type SyncCollectionOptions = {
@@ -1002,7 +1022,19 @@ export type SyncCollectionOptions = {
 export async function syncCollection(
   auth: SyncAuth & SyncCollectionOptions,
 ): Promise<SyncOutcome> {
-  return runOp<SyncOutcome>('syncCollection', auth);
+  const value = await runOp<unknown>('syncCollection', auth);
+  if (!value || typeof value !== 'object') throw invalidSyncPayload('collection sync');
+  const outcome = value as Partial<SyncOutcome>;
+  if (
+    !['noChanges', 'normalSyncRequired', 'fullSyncRequired'].includes(outcome.required ?? '') ||
+    typeof outcome.uploadOk !== 'boolean' ||
+    typeof outcome.downloadOk !== 'boolean' ||
+    typeof outcome.serverMessage !== 'string' ||
+    !(typeof outcome.newEndpoint === 'string' || outcome.newEndpoint === null)
+  ) {
+    throw invalidSyncPayload('collection sync');
+  }
+  return outcome as SyncOutcome;
 }
 
 export type MediaSyncResult = {
@@ -1010,8 +1042,21 @@ export type MediaSyncResult = {
   bytes: number;
 };
 
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function decodeMediaSyncResult(value: unknown): MediaSyncResult {
+  if (!value || typeof value !== 'object') throw invalidSyncPayload('media sync');
+  const result = value as Partial<MediaSyncResult>;
+  if (!isCount(result.files) || !isCount(result.bytes)) {
+    throw invalidSyncPayload('media sync');
+  }
+  return { files: result.files, bytes: result.bytes };
+}
+
 export async function syncMedia(auth: SyncAuth): Promise<MediaSyncResult> {
-  return runOp<MediaSyncResult>('syncMedia', auth);
+  return decodeMediaSyncResult(await runOp<unknown>('syncMedia', auth));
 }
 
 /** Live progress of a background media sync (see `syncMediaMonitored`). */
@@ -1038,12 +1083,37 @@ function isTransientSyncError(message: string): boolean {
   );
 }
 
+function decodeMediaProgress(value: unknown): MediaProgress {
+  if (!value || typeof value !== 'object') throw invalidSyncPayload('media progress');
+  const progress = value as Partial<MediaProgress>;
+  if (
+    typeof progress.done !== 'boolean' ||
+    !isCount(progress.checked) ||
+    !isCount(progress.downloadedFiles) ||
+    !isCount(progress.downloadedDeletions) ||
+    !isCount(progress.uploadedFiles) ||
+    !isCount(progress.uploadedDeletions) ||
+    (progress.files !== undefined && !isCount(progress.files)) ||
+    (progress.bytes !== undefined && !isCount(progress.bytes))
+  ) {
+    throw invalidSyncPayload('media progress');
+  }
+  return progress as MediaProgress;
+}
+
 async function syncMediaStart(auth: SyncAuth): Promise<void> {
-  await runOp('syncMediaStart', auth);
+  const value = await runOp<unknown>('syncMediaStart', auth);
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    (value as { started?: unknown }).started !== true
+  ) {
+    throw invalidSyncPayload('media sync start');
+  }
 }
 
 async function syncMediaPoll(): Promise<MediaProgress> {
-  return runOp<MediaProgress>('syncMediaPoll');
+  return decodeMediaProgress(await runOp<unknown>('syncMediaPoll'));
 }
 
 /**

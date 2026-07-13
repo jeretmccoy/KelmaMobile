@@ -1,4 +1,4 @@
-package com.kelmamobile
+package tech.kelma.mobile
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate

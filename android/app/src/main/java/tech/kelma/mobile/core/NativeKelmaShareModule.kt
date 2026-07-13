@@ -1,4 +1,4 @@
-package com.kelmamobile.core
+package tech.kelma.mobile.core
 
 import android.app.Activity
 import android.content.Intent

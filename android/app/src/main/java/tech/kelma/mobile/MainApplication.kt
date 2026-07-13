@@ -1,4 +1,4 @@
-package com.kelmamobile
+package tech.kelma.mobile
 
 import android.app.Application
 import com.facebook.react.PackageList
@@ -6,8 +6,8 @@ import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
 import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
-import com.kelmamobile.core.NativeKelmaCorePackage
-import com.kelmamobile.core.NativeKelmaSharePackage
+import tech.kelma.mobile.core.NativeKelmaCorePackage
+import tech.kelma.mobile.core.NativeKelmaSharePackage
 
 class MainApplication : Application(), ReactApplication {
 

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-package com.kelmamobile.core
+package tech.kelma.mobile.core
 
 import com.facebook.react.BaseReactPackage
 import com.facebook.react.bridge.NativeModule

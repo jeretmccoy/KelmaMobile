@@ -1,0 +1,6 @@
+Initial public Android release.
+
+* Real Anki/rslib collection and scheduler through the shared Kelma Rust core
+* Deck list, reviewer, editor, statistics, import, and export
+* KelmaSync v2 collection and media synchronization
+* Native Android JNI bridge built entirely from source

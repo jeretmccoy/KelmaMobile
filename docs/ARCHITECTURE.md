@@ -32,7 +32,7 @@ Both platforms now exercise the real backend:
 ```text
 Android:
   TypeScript → NativeKelmaCoreModule.kt
-    → anki-android-backend / rsdroid → JNI → Anki rslib
+    → JNI → Kelma Rust session → Anki rslib
 
 iOS:
   TypeScript → RCTNativeKelmaCore.mm
@@ -41,8 +41,9 @@ iOS:
 
 `getCoreInfo()` constructs and closes a real backend instance on each platform.
 It verifies packaging, native loading, TurboModule registration, and the
-JS/native contract before collection work begins. The portable iOS C ABI also
-exposes backend open, protobuf method dispatch, close, and buffer ownership.
+JS/native contract before collection work begins. The portable Rust ABI exposes
+backend/session open, named operation dispatch, close, and buffer ownership;
+iOS calls it directly and Android wraps it with four small JNI functions.
 
 ## Target core bridge
 

@@ -3,14 +3,15 @@
 Baseline inspected on 2026-06-29:
 
 - AnkiDroid `e6e941193fb4430dfa41d5931cdc6b762012ca30`
-- AnkiDroid backend `0.1.64-anki25.09.2`
-- packaged Anki/rslib `3890e12c9e48c028c3f12aa58cb64bd9f8895e30`
-- packaged Android bridge `f9b78ba145a64692a08c93c08fc17c3b723179f0`
+- AnkiDroid backend reference `0.1.64-anki25.09.2`
+- upstream Anki/rslib `3890e12c9e48c028c3f12aa58cb64bd9f8895e30` (`25.09.2`)
+- pinned mobile fork `1b6b59f21e9c23e965c360ce00b3fb35a36100fa`
 - local reference checkout `110cb8f3b1b3919fb4253e19810d87ca000436e6`
 
-The backend version is intentionally pinned to the AnkiDroid baseline until the
-Android and iOS bridge can be advanced together. The local reference checkout
-is newer than the packaged core and must not be linked into only one platform.
+The vendored rslib version is intentionally pinned to the AnkiDroid baseline,
+and both Android and iOS compile that exact source through `rust/kelma-core`.
+The local reference checkout is newer and must not be linked into only one
+platform.
 
 | Milestone | AnkiDroid reference | Kelma target | Status |
 |---|---|---|---|

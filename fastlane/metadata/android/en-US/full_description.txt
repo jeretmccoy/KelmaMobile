@@ -1,0 +1,13 @@
+Kelma is a free and open-source spaced-repetition flashcard app built on Anki's Rust core.
+
+Features include:
+
+* Anki-compatible collections, scheduling, and card rendering
+* SM-2 and FSRS scheduling through Anki's authoritative backend
+* Deck browsing, reviewing, editing, statistics, import, and export
+* Optional collection and media synchronization through KelmaSync
+* A shared React Native interface for Android and iOS
+
+Study behavior is not reimplemented in JavaScript. Collection data, scheduling, rendering, imports, exports, and sync run through the pinned open-source Anki/rslib backend.
+
+Kelma is licensed under AGPL-3.0-or-later.

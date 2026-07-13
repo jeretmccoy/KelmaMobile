@@ -1,5 +1,7 @@
 # Kelma Mobile
 
+[Source code](https://github.com/jeretmccoy/KelmaMobile) · [Issue tracker](https://github.com/jeretmccoy/KelmaMobile/issues) · AGPL-3.0-or-later
+
 Kelma is a spiritual fork of AnkiDroid with a shared React Native interface for
 Android and iOS. It remains Anki-compatible by using Anki's Rust backend for
 collections, scheduling, rendering data, imports/exports, and sync.
@@ -29,9 +31,9 @@ small set of coarse, rslib-backed operations through `src/core/KelmaCore.ts`:
 | `syncCollection` | Native v2 manifest/batch sync over rslib collections |
 | `syncMedia` | Scoped, concurrent KelmaSync v2 media transfer |
 
-On iOS these run through `rust/kelma-core` (the Kelma C ABI over the pinned
-`vendor/anki`). On Android they run through the same rslib via AnkiDroid's
-`rsdroid` backend. Both expose the identical coarse JSON contract.
+Both platforms run these operations through `rust/kelma-core` over the pinned
+`vendor/anki`: iOS links its C ABI as a static library, while Android packages
+it as a JNI shared library. Both expose the identical coarse JSON contract.
 
 ### Sync
 
@@ -52,6 +54,7 @@ Requirements:
 - Node.js 22.11 or newer
 - Android Studio/JDK for Android
 - Xcode and CocoaPods for iOS
+- Rust via `rustup` (native builds install the required platform targets)
 
 ```sh
 git submodule update --init --recursive
@@ -60,6 +63,30 @@ npm test
 npm run lint
 npm run android
 ```
+
+### Quick Android emulator testing
+
+On macOS, use Android Studio's bundled JDK instead of Java 25, which causes the
+Android CMake/Prefab configuration to fail. Add these lines to `~/.zshrc`, then
+run `source ~/.zshrc`:
+
+```sh
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+```
+
+Launch the configured emulator and run only its active CPU architecture:
+
+```sh
+emulator -avd KelmaPixel -dns-server 8.8.8.8,1.1.1.1
+
+# In another terminal:
+cd ~/projects/KelmaMobile
+npm run android -- --active-arch-only
+```
+
+Use `emulator -list-avds` if the virtual device has a different name.
 
 ### Quick Android device testing
 
@@ -86,10 +113,9 @@ $env:ANDROID_SERIAL='<adb-device-id>'; npm run android:device
 Useful APK commands:
 
 ```sh
-npm run android:apk:debug       # build debug APK only
-npm run android:install:debug   # build/install/launch debug APK
-npm run android:apk:release     # build release APK only, currently debug-signed
-npm run android:install:release # build/install/launch standalone release APK
+npm run android:apk:debug     # build debug APK only
+npm run android:install:debug # build/install/launch debug APK
+npm run android:apk:release   # build unsigned release APK for F-Droid
 ```
 
 For iOS:
@@ -102,27 +128,27 @@ cd ..
 npm run ios
 ```
 
-The unsigned AltStore release procedure and required sync regression suite are
-in [`docs/ios-release.md`](./docs/ios-release.md).
+The Android/F-Droid release procedure is in
+[`docs/android-release.md`](./docs/android-release.md). The unsigned AltStore
+procedure and required iOS sync regression suite are in
+[`docs/ios-release.md`](./docs/ios-release.md).
 
-Both builds target Anki core `25.09.2` at commit `3890e12c9e48`. iOS compiles
-the pinned `vendor/anki` source through `rust/kelma-core`. The first iOS build
-takes longer because Xcode cross-compiles rslib. Later TypeScript changes still
-use React Native Fast Refresh; Rust, Kotlin, Swift, and Objective-C++ changes
-require a native rebuild.
-
-> Android is not part of the iOS 1.1 rollout: its React Native module is still a
-> development stub. The real Android bridge is the next rollout milestone.
+Both builds use Anki core `25.09.2` plus a small pinned mobile patch at commit
+[`1b6b59f21e9c`](https://github.com/jeretmccoy/anki/commit/1b6b59f21e9c23e965c360ce00b3fb35a36100fa),
+and compile the `vendor/anki` source through `rust/kelma-core`. Gradle invokes
+`scripts/build-rust-for-android.sh` for the requested Android ABI; CocoaPods does
+the equivalent for iOS. The first native build takes longer while Rust compiles
+rslib. Later TypeScript changes still use React Native Fast Refresh; Rust,
+Kotlin, Java, Swift, and Objective-C++ changes require a native rebuild.
 
 ## Source baselines
 
-- AnkiDroid: `~/projects/ankidroid-source`
-- Pinned Anki/rslib: `vendor/anki` (Git submodule)
-- Kelma sync server: `~/projects/kelma_sync`
+- AnkiDroid UX reference: <https://github.com/ankidroid/Anki-Android>
+- Pinned Anki/rslib fork: [`vendor/anki`](./vendor/anki) at
+  [`kelma-mobile-25.09.2`](https://github.com/jeretmccoy/anki/tree/kelma-mobile-25.09.2)
 
-The AnkiDroid and KelmaSync sibling paths are reference checkouts, not runtime
-dependencies. The pinned Anki submodule is part of Kelma's reproducible iOS
-build.
+The pinned submodule is compiled from source as part of both reproducible native
+builds; no sibling checkout is a runtime dependency.
 
 ## Licensing
 

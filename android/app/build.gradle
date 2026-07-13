@@ -72,47 +72,67 @@ def enableProguardInReleaseBuilds = false
  */
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
 
+// Build the same Kelma/rslib session used on iOS as a JNI library. Respect the
+// React Native architecture override so emulator builds compile only the active
+// ABI, while release builds still package every configured ABI.
+def rustCoreAbis = (project.findProperty('reactNativeArchitectures') ?: 'arm64-v8a')
+    .split(',')
+    .collect { it.trim() }
+    .findAll { !it.isEmpty() }
+def rustJniOutput = file("$buildDir/rustJniLibs")
+def rustCoreTasks = rustCoreAbis.collect { abi ->
+    def suffix = abi.split(/[-_]/).collect { it.capitalize() }.join('')
+    tasks.register("buildKelmaRustCore${suffix}", Exec) {
+        workingDir rootProject.projectDir.parentFile
+        commandLine file('../../scripts/build-rust-for-android.sh'), abi, rustJniOutput
+        environment 'ANDROID_NDK_VERSION', rootProject.ext.ndkVersion
+        inputs.file(file('../../scripts/build-rust-for-android.sh'))
+        inputs.file(file('../../rust/kelma-core/Cargo.toml'))
+        inputs.file(file('../../rust/kelma-core/Cargo.lock'))
+        inputs.dir(file('../../rust/kelma-core/src'))
+        inputs.file(file('../../vendor/anki/.git'))
+        outputs.file(file("$rustJniOutput/$abi/libkelma_core.so"))
+    }
+}
+def buildKelmaRustCore = tasks.register('buildKelmaRustCore') {
+    dependsOn rustCoreTasks
+}
+
 android {
     ndkVersion rootProject.ext.ndkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
-    namespace "com.kelmamobile"
+    namespace "tech.kelma.mobile"
+    sourceSets {
+        main {
+            jniLibs.srcDir rustJniOutput
+        }
+    }
     defaultConfig {
-        applicationId "com.kelmamobile"
+        applicationId "tech.kelma.mobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
-    }
-    signingConfigs {
-        debug {
-            storeFile file('debug.keystore')
-            storePassword 'android'
-            keyAlias 'androiddebugkey'
-            keyPassword 'android'
-        }
+        versionCode 1001004
+        versionName "1.1.4"
     }
     buildTypes {
-        debug {
-            signingConfig signingConfigs.debug
-        }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            // Official F-Droid builds must be unsigned; fdroidserver applies
+            // the repository signing key after rebuilding from public source.
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
 }
 
+tasks.named('preBuild').configure {
+    dependsOn buildKelmaRustCore
+}
+
 dependencies {
-    // The version of react-native is set by the React Native Gradle Plugin
+    // The version of react-native is set by the React Native Gradle Plugin.
     implementation("com.facebook.react:react-android")
-    // Anki's real Rust collection/scheduler/sync backend, packaged with its
-    // generated Kotlin protobuf API. Keep this aligned with upstream AnkiDroid.
-    implementation("io.github.david-allison:anki-android-backend:0.1.64-anki25.09.2")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

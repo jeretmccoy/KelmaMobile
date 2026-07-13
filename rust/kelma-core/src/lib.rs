@@ -1,6 +1,8 @@
 // Kelma's portable C ABI for Anki rslib.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#[cfg(target_os = "android")]
+mod android_jni;
 mod session;
 
 use std::{
@@ -19,7 +21,7 @@ use serde_json::{json, Value};
 use crate::session::KelmaSession;
 
 pub const ANKI_VERSION: &str = "25.09.2";
-const ANKI_COMMIT: &str = "3890e12c9e48c028c3f12aa58cb64bd9f8895e30";
+const ANKI_COMMIT: &str = "1b6b59f21e9c23e965c360ce00b3fb35a36100fa";
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const STATUS_OK: i32 = 0;
@@ -203,7 +205,7 @@ pub extern "C" fn kelma_core_info() -> KelmaResult {
                 "ankiVersion": ANKI_VERSION,
                 "ankiCommit": ANKI_COMMIT,
                 "bridgeVersion": BRIDGE_VERSION,
-                "platform": "ios",
+                "platform": if cfg!(target_os = "android") { "android" } else { "ios" },
             })
             .to_string()
             .into_bytes(),

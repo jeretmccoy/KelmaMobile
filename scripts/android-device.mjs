@@ -12,7 +12,7 @@ const gradlew = path.join(androidDir, process.platform === 'win32' ? 'gradlew.ba
 const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
 const apk = {
   debug: path.join(androidDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'),
-  release: path.join(androidDir, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk'),
+  release: path.join(androidDir, 'app', 'build', 'outputs', 'apk', 'release', 'app-release-unsigned.apk'),
 }
 
 const mode = process.argv[2] || 'run'
@@ -257,7 +257,7 @@ function install(variant) {
   const serial = getDevice()
   build(variant)
   run('adb', ['-s', serial, 'install', '-r', apk[variant]])
-  run('adb', ['-s', serial, 'shell', 'monkey', '-p', 'com.kelmamobile', '-c', 'android.intent.category.LAUNCHER', '1'])
+  run('adb', ['-s', serial, 'shell', 'monkey', '-p', 'tech.kelma.mobile', '-c', 'android.intent.category.LAUNCHER', '1'])
 
   if (variant === 'debug') {
     console.log('\nDebug APK launched. If it shows a Metro error, run `npm start` in another terminal and reload the app.')
@@ -283,7 +283,7 @@ function doctor() {
   console.log('\nMain commands:')
   console.log('  npm run android:device          Build + install + launch on plugged phone')
   console.log('  npm run android:install:debug   Build/install debug APK')
-  console.log('  npm run android:install:release Build/install standalone release APK')
+  console.log('  npm run android:apk:release     Build unsigned F-Droid release APK')
 }
 
 switch (mode) {
@@ -305,14 +305,11 @@ switch (mode) {
   case 'install:debug':
     install('debug')
     break
-  case 'install:release':
-    install('release')
-    break
   case 'doctor':
     doctor()
     break
   default:
     console.error(`Unknown mode: ${mode}`)
-    console.error('Expected one of: run, apk:debug, apk:release, install:debug, install:release, doctor')
+    console.error('Expected one of: run, apk:debug, apk:release, install:debug, doctor')
     process.exit(1)
 }
