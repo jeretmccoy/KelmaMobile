@@ -6,8 +6,8 @@ beforeEach(() => {
     json: async () => ({
       schema: 1,
       ios: {
-        version: '1.1.5',
-        build: 7,
+        version: '1.1.6',
+        build: 8,
         url: 'https://kelma.tech/altstore/KelmaMobile.ipa',
         sha256: 'a'.repeat(64),
         size: 123,
@@ -25,8 +25,8 @@ test('compares dotted versions numerically', () => {
 
 test('validates and returns the iOS update', async () => {
   await expect(fetchMobileUpdate()).resolves.toMatchObject({
-    version: '1.1.5',
-    build: 7,
+    version: '1.1.6',
+    build: 8,
   });
-  await expect(availableMobileUpdate()).resolves.toMatchObject({ version: '1.1.5' });
+  await expect(availableMobileUpdate()).resolves.toMatchObject({ version: '1.1.6' });
 });

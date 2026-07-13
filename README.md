@@ -46,6 +46,25 @@ metadata and deletions, and transfers referenced media with 50 connections.
 Tied content changes and deletion-vs-local-edit conflicts always ask the user
 which result to keep.
 
+## Install on Android
+
+The official F-Droid package (`tech.kelma.mobile`) is pending review in
+[F-Droid RFP #4111](https://gitlab.com/fdroid/rfp/-/work_items/4111).
+For immediate installation, download the architecture-appropriate **Kelma
+Direct** APK (`tech.kelma.mobile.direct`) from
+[GitHub Releases](https://github.com/jeretmccoy/KelmaMobile/releases/latest).
+Android will ask permission to install apps from the browser or file manager.
+
+For automatic direct-build updates without Google Play, install
+[Obtainium](https://github.com/ImranR98/Obtainium) and add this repository URL:
+
+```text
+https://github.com/jeretmccoy/KelmaMobile
+```
+
+The F-Droid and direct packages have separate IDs and signing keys, so they may
+be installed side by side. See the published certificate and release procedure
+in [`docs/android-release.md`](./docs/android-release.md).
 
 ## Development
 
@@ -116,6 +135,7 @@ Useful APK commands:
 npm run android:apk:debug     # build debug APK only
 npm run android:install:debug # build/install/launch debug APK
 npm run android:apk:release   # build unsigned release APK for F-Droid
+npm run android:apk:direct    # build signed GitHub/Obtainium APKs (maintainer only)
 ```
 
 For iOS:

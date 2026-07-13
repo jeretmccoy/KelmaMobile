@@ -4,7 +4,17 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import {
+  Alert,
+  Linking,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  View,
+} from 'react-native';
 import { MOBILE_APP_VERSION, SYNC_CLIENT_VERSION } from '../config';
 import { getSyncDebug, type SyncDebug } from '../core/KelmaCore';
 import { availableMobileUpdate } from '../update';
@@ -129,19 +139,21 @@ export function SettingsScreen({
       <View style={styles.card}>
         <Text style={styles.rowTitle}>Kelma Mobile {MOBILE_APP_VERSION}</Text>
         <Text style={styles.rowDescription}>{SYNC_CLIENT_VERSION}</Text>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Check for Kelma Mobile updates"
-          disabled={checkingUpdate}
-          onPress={checkForUpdate}
-          style={({ pressed }) => [
-            styles.updateButton,
-            pressed && styles.updatePressed,
-          ]}>
-          <Text style={styles.updateText}>
-            {checkingUpdate ? 'Checking…' : 'Check for updates'}
-          </Text>
-        </Pressable>
+        {Platform.OS === 'ios' ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Check for Kelma Mobile updates"
+            disabled={checkingUpdate}
+            onPress={checkForUpdate}
+            style={({ pressed }) => [
+              styles.updateButton,
+              pressed && styles.updatePressed,
+            ]}>
+            <Text style={styles.updateText}>
+              {checkingUpdate ? 'Checking…' : 'Check for updates'}
+            </Text>
+          </Pressable>
+        ) : null}
         <Text style={styles.license}>AGPL-3.0-or-later</Text>
       </View>
     </ScrollView>

@@ -1,6 +1,6 @@
 {
   "name": "KelmaMobile",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "license": "AGPL-3.0-or-later",
   "private": true,
   "scripts": {
@@ -9,6 +9,7 @@
     "android:doctor": "node scripts/android-device.mjs doctor",
     "android:apk:debug": "node scripts/android-device.mjs apk:debug",
     "android:apk:release": "node scripts/android-device.mjs apk:release",
+    "android:apk:direct": "scripts/build-android-direct.sh",
     "android:install:debug": "node scripts/android-device.mjs install:debug",
     "codegen:android": "react-native codegen --platform android",
     "ios": "react-native run-ios",

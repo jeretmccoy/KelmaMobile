@@ -1,0 +1,3 @@
+Adds developer-signed GitHub and Obtainium releases under a separate application ID.
+Pins the Gradle distribution checksum for safer builds.
+Keeps the iOS-only AltStore update control hidden on Android.

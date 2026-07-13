@@ -284,6 +284,7 @@ function doctor() {
   console.log('  npm run android:device          Build + install + launch on plugged phone')
   console.log('  npm run android:install:debug   Build/install debug APK')
   console.log('  npm run android:apk:release     Build unsigned F-Droid release APK')
+  console.log('  npm run android:apk:direct      Build signed GitHub/Obtainium APKs')
 }
 
 switch (mode) {

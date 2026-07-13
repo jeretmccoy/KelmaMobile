@@ -32,6 +32,8 @@ local.properties
 *.hprof
 .cxx/
 *.keystore
+*.jks
+*.p12
 .kotlin/
 
 # node.js
@@ -52,8 +54,9 @@ yarn-error.log
 **/fastlane/screenshots
 **/fastlane/test_output
 
-# Bundle artifact
+# Release artifacts
 *.jsbundle
+/dist/android/
 
 # Ruby / CocoaPods
 **/Pods/

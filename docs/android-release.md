@@ -1,8 +1,15 @@
-# Android / F-Droid release process
+# Android release process
 
-Kelma's permanent Android application ID is `tech.kelma.mobile`. Official
-F-Droid builds are deliberately unsigned: F-Droid rebuilds each tagged version
-from public source and applies its repository signing key.
+Kelma has two intentionally separate Android distribution identities:
+
+| Channel | Application ID | Signing authority |
+| --- | --- | --- |
+| Official F-Droid | `tech.kelma.mobile` | F-Droid |
+| GitHub / Obtainium | `tech.kelma.mobile.direct` | Kelma upstream |
+
+Keeping separate IDs prevents Android signature conflicts and lets both builds
+coexist on one device. F-Droid builds remain unsigned in the source checkout;
+fdroidserver signs them after rebuilding from the public tag.
 
 ## Prerequisites
 
@@ -17,8 +24,8 @@ from public source and applies its repository signing key.
 
 1. Update `versionName` and monotonically increase `versionCode` in
    `android/app/build.gradle`.
-2. Keep `package.json` and `rust/kelma-core/Cargo.toml` on the same public
-   version.
+2. Keep `package.json`, `src/config.ts`, the iOS marketing version, and
+   `rust/kelma-core/Cargo.toml` on the same public version.
 3. Add `fastlane/metadata/android/en-US/changelogs/<versionCode>.txt`.
 4. Run the validation suite:
 
@@ -30,37 +37,62 @@ from public source and applies its repository signing key.
    npm run rust:test
    ```
 
-5. Build the unsigned release APK from source:
+5. Commit and push, then create and push an annotated tag named
+   `android-v<version>`, for example `android-v1.1.5`.
 
-   ```sh
-   npm run android:apk:release
-   ```
+Never commit an Android signing key, keystore password, account token, or APK.
 
-   Output: `android/app/build/outputs/apk/release/app-release-unsigned.apk`.
+## Official F-Droid build
 
-6. Confirm its package/version and confirm that it has no signature:
+Build the unsigned package from source:
 
-   ```sh
-   aapt dump badging android/app/build/outputs/apk/release/app-release-unsigned.apk | head
-   apksigner verify android/app/build/outputs/apk/release/app-release-unsigned.apk
-   ```
+```sh
+npm run android:apk:release
+```
 
-   `apksigner` must report that the APK does not verify; fdroidserver signs it.
+Output: `android/app/build/outputs/apk/release/app-release-unsigned.apk`.
+Confirm its identity and lack of signature:
 
-7. Commit, push, and create an annotated tag named `android-v<version>`, for
-   example `android-v1.1.4`.
+```sh
+aapt dump badging android/app/build/outputs/apk/release/app-release-unsigned.apk | head
+apksigner verify android/app/build/outputs/apk/release/app-release-unsigned.apk
+```
 
-Never commit an Android signing key, keystore password, account token, or a
-locally signed release APK.
+The application ID must be `tech.kelma.mobile`, and `apksigner` must report that
+the APK does not verify. The F-Droid recipe must initialize git submodules, run
+`npm ci`, install the Rust Android target, use NDK r27b, and assemble `release`.
+The packaging request is tracked at
+<https://gitlab.com/fdroid/rfp/-/work_items/4111>.
 
-## Official F-Droid catalog
+## GitHub / Obtainium build
 
-F-Droid does not accept an uploaded APK. Submit the public source/tag to the
-[F-Droid Request For Packaging tracker](https://gitlab.com/fdroid/rfp/-/issues),
-or contribute `metadata/tech.kelma.mobile.yml` directly to
-[`fdroiddata`](https://gitlab.com/fdroid/fdroiddata). The recipe must initialize
-git submodules, run `npm ci`, install the Rust Android target, use NDK 27, and
-build the unsigned `release` variant.
+The direct build is enabled only with `-PkelmaDirect=true`. The release script
+retrieves the local password from macOS Keychain, builds signed APKs for each
+Android ABI, verifies their signing certificate, and writes artifacts under
+`dist/android/`:
 
-After the first recipe is accepted, F-Droid's update checker can follow tags
-matching `android-v%v` and build later releases automatically.
+```sh
+npm run android:apk:direct
+```
+
+The upstream signing certificate SHA-256 is:
+
+```text
+f7cca2aaf28eb372e35fb797e0e7a481ff90137afbc9d37a54a04bf681430583
+```
+
+Its public certificate is committed as
+[`kelma-direct-signing-certificate.pem`](./kelma-direct-signing-certificate.pem).
+The private keystore and password must remain outside Git and must be backed up
+securely for the lifetime of the app. Losing the private key makes updates to
+existing direct installations impossible.
+
+After validating the APKs, attach every architecture APK and `.sha256` file to
+the matching GitHub release. Obtainium users add this source URL:
+
+```text
+https://github.com/jeretmccoy/KelmaMobile
+```
+
+Obtainium detects the APKs from GitHub Releases and selects by CPU architecture.
+It does not require Google Play or a Google developer account.

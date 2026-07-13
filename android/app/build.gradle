@@ -80,9 +80,15 @@ def rustCoreAbis = (project.findProperty('reactNativeArchitectures') ?: 'arm64-v
     .collect { it.trim() }
     .findAll { !it.isEmpty() }
 def rustJniOutput = file("$buildDir/rustJniLibs")
+def prepareKelmaRustCore = tasks.register('prepareKelmaRustCore') {
+    doLast {
+        delete rustJniOutput
+    }
+}
 def rustCoreTasks = rustCoreAbis.collect { abi ->
     def suffix = abi.split(/[-_]/).collect { it.capitalize() }.join('')
     tasks.register("buildKelmaRustCore${suffix}", Exec) {
+        dependsOn prepareKelmaRustCore
         workingDir rootProject.projectDir.parentFile
         commandLine file('../../scripts/build-rust-for-android.sh'), abi, rustJniOutput
         environment 'ANDROID_NDK_VERSION', rootProject.ext.ndkVersion
@@ -98,6 +104,20 @@ def buildKelmaRustCore = tasks.register('buildKelmaRustCore') {
     dependsOn rustCoreTasks
 }
 
+// F-Droid builds the default, unsigned package. The opt-in direct distribution
+// uses a separate application ID and an upstream key supplied only through the
+// environment, so the two signing ecosystems can coexist on one device.
+def directDistribution = (project.findProperty('kelmaDirect') ?: 'false').toBoolean()
+def directKeystore = System.getenv('KELMA_DIRECT_KEYSTORE')
+def directStorePassword = System.getenv('KELMA_DIRECT_STORE_PASSWORD')
+def directKeyPassword = System.getenv('KELMA_DIRECT_KEY_PASSWORD') ?: directStorePassword
+def directKeyAlias = System.getenv('KELMA_DIRECT_KEY_ALIAS') ?: 'kelma-direct'
+if (directDistribution && (!directKeystore || !directStorePassword)) {
+    throw new GradleException(
+        'Direct builds require KELMA_DIRECT_KEYSTORE and KELMA_DIRECT_STORE_PASSWORD.'
+    )
+}
+
 android {
     ndkVersion rootProject.ext.ndkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
@@ -110,16 +130,41 @@ android {
         }
     }
     defaultConfig {
-        applicationId "tech.kelma.mobile"
+        applicationId directDistribution ? "tech.kelma.mobile.direct" : "tech.kelma.mobile"
+        manifestPlaceholders += [appLabel: directDistribution ? "Kelma Direct" : "Kelma"]
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1001004
-        versionName "1.1.4"
+        versionCode 1001005
+        versionName "1.1.5"
+    }
+    signingConfigs {
+        directRelease {
+            if (directDistribution) {
+                storeFile file(directKeystore)
+                storePassword directStorePassword
+                keyAlias directKeyAlias
+                keyPassword directKeyPassword
+                storeType "PKCS12"
+            }
+        }
+    }
+    splits {
+        abi {
+            enable directDistribution
+            if (directDistribution) {
+                reset()
+                rustCoreAbis.each { abiName -> include abiName }
+                universalApk false
+            }
+        }
     }
     buildTypes {
         release {
             // Official F-Droid builds must be unsigned; fdroidserver applies
             // the repository signing key after rebuilding from public source.
+            if (directDistribution) {
+                signingConfig signingConfigs.directRelease
+            }
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }

@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "kelma_core"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anki",
  "anki_proto",
