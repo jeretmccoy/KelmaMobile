@@ -12,17 +12,25 @@
       "iconURL": "https://kelma.tech/altstore/icon.png",
       "tintColor": "0D9488",
       "category": "education",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "versionDate": "2026-07-12",
       "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
-      "size": 13589082,
-      "sha256": "23ec98adbac406f2f1803c1113009dc97d70d10e7757c2d3454d9d9b8d4e78dd",
+      "size": 13594069,
+      "sha256": "788e7411f24eb8cc99428539f28b9521e51f977660ddcf2f14f9f31c1e26cc9f",
       "versions": [
+        {
+          "version": "1.1.2",
+          "date": "2026-07-12",
+          "localizedDescription": "Fixes Reset & Download: local content, media, and v2 state are deleted on-device while login is preserved, then the collection is restored exclusively through KelmaSync v2 without calling a legacy API route.",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "size": 13594069,
+          "sha256": "788e7411f24eb8cc99428539f28b9521e51f977660ddcf2f14f9f31c1e26cc9f"
+        },
         {
           "version": "1.1.1",
           "date": "2026-07-12",
           "localizedDescription": "More reliable KelmaSync v2 connections with pooled keepalive requests, the canonical sync2.kelma.tech endpoint, automatic migration of existing login tokens, and clearer Kelma Immersion account guidance.",
-          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.1.ipa",
           "size": 13589082,
           "sha256": "23ec98adbac406f2f1803c1113009dc97d70d10e7757c2d3454d9d9b8d4e78dd"
         },
