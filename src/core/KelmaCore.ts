@@ -666,9 +666,8 @@ export type MediaManifest = {
   files: number;
 };
 
-/** The full collection manifest returned by `/sync/inspect` and
- *  `localManifest`. Same shape on both sides so the compare view can diff them
- *  field-by-field. See `docs/REDESIGN.md`. */
+/** The normalized manifest returned by `localManifest` and by the native
+ *  adapter over KelmaSync v2's `/v2/sync/manifest`. */
 export type Manifest = {
   ts: number;
   mod: number;
@@ -685,8 +684,7 @@ export async function getLocalManifest(): Promise<Manifest> {
   return runOp<Manifest>('localManifest');
 }
 
-/** Fetch the server's read-only manifest via `GET /sync/inspect`. When
- *  `since` is given, only notes whose usn advanced past it are returned. */
+/** Fetch the server's read-only KelmaSync v2 manifest. */
 export async function getServerManifest(
   auth: SyncAuth,
   since?: number,
@@ -722,7 +720,7 @@ export async function getLocalNoteDetail(
   return runOp<NoteDetail | null>('localNoteDetail', { nid, guid: guid ?? '' });
 }
 
-/** Fetch one note's full content from the server (`GET /sync/inspect/note`). */
+/** Fetch one note's full content from its KelmaSync v2 GUID resource. */
 export async function getServerNoteDetail(
   auth: SyncAuth,
   nid: number,
@@ -735,8 +733,7 @@ export async function getServerNoteDetail(
   });
 }
 
-/** Force a local note onto the server ("force local → server") via
- *  `PUT /sync/notes/:guid`. Bumps the server note's usn; no full sync. */
+/** Force a local note onto its KelmaSync v2 GUID resource. */
 export async function writeServerNote(
   auth: SyncAuth,
   note: NoteDetail,
@@ -787,6 +784,17 @@ export type NoteDiff = {
 
 /** Diff two manifests deck-by-deck (keyed by name, since ids differ across
  *  collections). Returns one entry per deck that exists on either side. */
+function deckContentSignature(manifest: Manifest, deckId: number): string {
+  const deck = manifest.decks.find(candidate => candidate.id === deckId);
+  const notes = manifest.notes
+    .filter(note => (note.decks ?? []).includes(deckId))
+    .map(note => `${note.guid}\u0000${note.hash ?? ''}\u0000${cardCountInDeck(note, deckId)}`)
+    .sort();
+  return notes.length
+    ? notes.join('\u0001')
+    : `empty\u0000${deck?.cards ?? 0}\u0000${deck?.notes ?? 0}`;
+}
+
 export function diffManifests(local: Manifest, server: Manifest): DeckDiff[] {
   const localByName = new Map(local.decks.map(d => [d.name, d]));
   const serverByName = new Map(server.decks.map(d => [d.name, d]));
@@ -796,7 +804,7 @@ export function diffManifests(local: Manifest, server: Manifest): DeckDiff[] {
     const l = localByName.get(name);
     const s = serverByName.get(name);
     if (l && s) {
-      if (l.hash === s.hash) {
+      if (deckContentSignature(local, l.id) === deckContentSignature(server, s.id)) {
         diffs.push({ status: 'in-sync', deck: l });
       } else if (l.mod > s.mod) {
         diffs.push({ status: 'local-newer', deck: l, server: s });
@@ -834,7 +842,7 @@ function groupNotesByGuid(notes: NoteManifest[], deckId: number): Map<string, No
 
 function noteStatus(local: NoteManifest | undefined, server: NoteManifest | undefined, localDeckId: number, serverDeckId: number): NoteDiffStatus {
   if (local && server) {
-    const fieldsMatch = local.hash === server.hash && local.mod === server.mod;
+    const fieldsMatch = local.hash === server.hash;
     if (fieldsMatch) {
       return cardCountInDeck(local, localDeckId) !== cardCountInDeck(server, serverDeckId)
         ? 'card-count'

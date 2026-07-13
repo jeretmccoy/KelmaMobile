@@ -1143,9 +1143,9 @@ impl KelmaSession {
         })
     }
 
-    /// Local collection manifest — the same shape as the server's `/sync/inspect`
-    /// response, computed from the local collection. Used by the compare view to
-    /// diff local vs server before syncing. See the KelmaSync REDESIGN doc.
+    /// Local collection manifest in the normalized shape used by the compare
+    /// view. The server side adapts KelmaSync v2's resource manifest into this
+    /// same shape; no legacy Anki-wire inspect endpoint is involved.
     pub fn local_manifest(&self) -> Result<Value, String> {
         use sha2::{Digest, Sha256};
         use std::collections::HashMap;
@@ -1319,22 +1319,23 @@ impl KelmaSession {
             let mut notes: Vec<Value> = Vec::new();
             {
                 let mut stmt =
-                    db.prepare("SELECT id, guid, mid, mod, flds FROM notes ORDER BY guid")?;
+                    db.prepare("SELECT id, guid, mid, mod, flds, tags FROM notes ORDER BY guid")?;
                 let rows = stmt.query_map([], |r| {
                     let nid: i64 = r.get(0)?;
                     let guid: String = r.get(1)?;
                     let flds: String = r.get(4)?;
+                    let tags: String = r.get(5)?;
                     let decks = note_decks.remove(&nid).unwrap_or_default();
                     let card_map = note_cards.remove(&nid).unwrap_or_default();
                     let cards_per_deck: Vec<i64> = decks
                         .iter()
                         .map(|did| card_map.get(did).copied().unwrap_or(0))
                         .collect();
-                    let field_hash = Sha256::digest(flds.as_bytes());
-                    let mut field_hex = String::with_capacity(field_hash.len() * 2);
-                    for b in field_hash {
-                        field_hex.push_str(&format!("{b:02x}"));
-                    }
+                    let fields = flds.split('\u{1f}').map(str::to_string).collect::<Vec<_>>();
+                    let tags = tags
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
                     Ok(json!({
                         "guid": guid,
                         "nid": nid,
@@ -1342,7 +1343,7 @@ impl KelmaSession {
                         "mod": r.get::<_, i64>(3)?,
                         "decks": decks,
                         "cards_per_deck": cards_per_deck,
-                        "hash": format!("sha256:{field_hex}"),
+                        "hash": v2_note_checksum(&fields, &tags),
                         "preview": note_preview(&flds),
                     }))
                 })?;
@@ -1373,46 +1374,13 @@ impl KelmaSession {
         Ok(manifest)
     }
 
-    /// Fetch the server's manifest via `GET /sync/inspect`. `request` is
-    /// `{hkey, endpoint}` (same shape as `syncCollection`). Returns the server's
-    /// read-only collection state for the compare view.
+    /// Fetch and adapt the KelmaSync v2 manifest for the visible compare view.
+    /// No legacy Anki-wire inspect endpoint is involved.
     pub fn server_manifest(&self, request: &Value) -> Result<Value, String> {
-        let auth = sync_auth_from(request)?;
-        let endpoint = auth
-            .endpoint
-            .as_ref()
-            .map(|u| u.as_str().trim_end_matches('/'))
-            .unwrap_or("");
-        if endpoint.is_empty() {
-            return Err("missing endpoint".into());
-        }
-        // Optional `since=<usn>`: return only notes changed past that usn.
-        let url = match request.get("since").and_then(Value::as_i64) {
-            Some(s) => format!("{endpoint}/sync/inspect?since={s}"),
-            None => format!("{endpoint}/sync/inspect"),
-        };
-        let header = json!({
-            "v": 11,
-            "k": auth.hkey,
-            "c": kelma_client_label(),
-            "s": "",
-        })
-        .to_string();
-
-        let resp = block_on(async {
-            web_client()
-                .get(&url)
-                .header("anki-sync", &header)
-                .send()
-                .await
-                .map_err(|e| format!("{e:?}"))?
-                .error_for_status()
-                .map_err(|e| format!("{e:?}"))?
-                .json::<Value>()
-                .await
-                .map_err(|e| format!("{e:?}"))
-        })?;
-        Ok(resp)
+        let token = str_field(request, "hkey")?;
+        let endpoint = str_field(request, "endpoint")?;
+        let manifest = v2_json("GET", &endpoint, "/v2/sync/manifest", Some(&token), None)?;
+        Ok(v2_manifest_for_compare(&manifest))
     }
 
     /// Full field/card content for one *local* note, by nid (preferred) or
@@ -1477,88 +1445,120 @@ impl KelmaSession {
         })
     }
 
-    /// Fetch one note's full content from the server via
-    /// `GET /sync/inspect/note`. `request` is `{hkey, endpoint, nid?, guid?}`.
+    /// Fetch one note's full content through KelmaSync v2. `request` is
+    /// `{hkey, endpoint, guid}`; v2 resources are GUID-addressed.
     pub fn server_note_detail(&self, request: &Value) -> Result<Value, String> {
-        let auth = sync_auth_from(request)?;
-        let endpoint = auth
-            .endpoint
-            .as_ref()
-            .map(|u| u.as_str().trim_end_matches('/'))
-            .unwrap_or("");
-        if endpoint.is_empty() {
-            return Err("missing endpoint".into());
-        }
-        let nid = request.get("nid").and_then(Value::as_i64).unwrap_or(0);
+        let token = str_field(request, "hkey")?;
+        let endpoint = str_field(request, "endpoint")?;
         let guid = request.get("guid").and_then(Value::as_str).unwrap_or("");
-        let mut url = format!("{endpoint}/sync/inspect/note?guid={}", urlencode(guid));
-        if nid != 0 {
-            url.push_str(&format!("&nid={nid}"));
+        if guid.is_empty() {
+            return Ok(Value::Null);
         }
-        let header = inspect_header(&auth.hkey);
-        let resp = block_on(async {
-            let r = web_client()
-                .get(&url)
-                .header("anki-sync", &header)
-                .send()
-                .await
-                .map_err(|e| format!("{e:?}"))?;
-            if r.status().as_u16() == 404 {
-                return Ok(Value::Null);
-            }
-            r.error_for_status()
-                .map_err(|e| format!("{e:?}"))?
-                .json::<Value>()
-                .await
-                .map_err(|e| format!("{e:?}"))
-        })?;
-        Ok(resp)
+        let path = format!("/v2/notes/{}", urlencode(guid));
+        let note = match v2_json("GET", &endpoint, &path, Some(&token), None) {
+            Ok(note) => note,
+            Err(error) if error.contains("404") => return Ok(Value::Null),
+            Err(error) => return Err(error),
+        };
+        let fields = note
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        let tags = note
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let modified = note
+            .get("client_modified_at")
+            .or_else(|| note.get("modified_at"))
+            .and_then(Value::as_str)
+            .and_then(rfc3339_to_secs)
+            .unwrap_or(0);
+        Ok(json!({
+            "guid": guid,
+            "nid": request.get("nid").and_then(Value::as_i64).unwrap_or(0),
+            "mid": note.get("notetype_id").and_then(Value::as_i64).unwrap_or(0),
+            "mod": modified,
+            "flds": fields,
+            "tags": tags,
+            "cards": [],
+        }))
     }
 
-    /// Write a local note to the server ("force local → server") via
-    /// `PUT /sync/notes/:guid`. `request` is `{hkey, endpoint, note}` where
-    /// `note` is a local_note_detail shape.
+    /// Force a local note onto its KelmaSync v2 GUID resource.
     pub fn write_server_note(&self, request: &Value) -> Result<Value, String> {
-        let auth = sync_auth_from(request)?;
-        let endpoint = auth
-            .endpoint
-            .as_ref()
-            .map(|u| u.as_str().trim_end_matches('/'))
-            .unwrap_or("");
-        if endpoint.is_empty() {
-            return Err("missing endpoint".into());
-        }
+        let token = str_field(request, "hkey")?;
+        let endpoint = str_field(request, "endpoint")?;
         let note = request.get("note").ok_or("missing 'note'")?;
         let guid = note.get("guid").and_then(Value::as_str).unwrap_or("");
         if guid.is_empty() {
             return Err("cannot push a note with an empty GUID".into());
         }
+        let fields = note
+            .get("flds")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split('\u{1f}')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let tags = note
+            .get("tags")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let modified = note
+            .get("mod")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| TimestampSecs::now().0);
         let body = json!({
-            "guid": guid,
-            "mid": note.get("mid").and_then(Value::as_i64).unwrap_or(0),
-            "mod": note.get("mod").and_then(Value::as_i64).unwrap_or(0),
-            "flds": note.get("flds").and_then(Value::as_str).unwrap_or(""),
-            "tags": note.get("tags").and_then(Value::as_str).unwrap_or(""),
-            "cards": note.get("cards").cloned().unwrap_or(json!([])),
+            "notetype_id": note.get("mid").and_then(Value::as_i64).unwrap_or(0),
+            "fields": fields,
+            "tags": tags,
+            "client_modified_at": rfc3339_from_secs(modified),
+            "base_checksum": "",
         });
-        let url = format!("{endpoint}/sync/notes/{}", urlencode(guid));
-        let header = inspect_header(&auth.hkey);
-        let resp = block_on(async {
-            web_client()
-                .put(&url)
-                .header("anki-sync", &header)
-                .header("content-type", "application/json")
-                .body(body.to_string())
+        let url = format!(
+            "{}/v2/notes/{}",
+            endpoint.trim_end_matches('/'),
+            urlencode(guid)
+        );
+        block_on(async {
+            let response = web_client()
+                .put(url)
+                .bearer_auth(&token)
+                .header("user-agent", kelma_client_label())
+                .header("force-override", "true")
+                .json(&body)
                 .send()
                 .await
-                .map_err(|e| format!("{e:?}"))?
-                .error_for_status()
-                .map_err(|e| format!("{e:?}"))?
-                .json::<Value>()
+                .map_err(|error| format!("v2 force note: {error}"))?;
+            let status = response.status();
+            let text = response
+                .text()
                 .await
-                .map_err(|e| format!("{e:?}"))
+                .map_err(|error| format!("v2 force note response: {error}"))?;
+            if !status.is_success() {
+                return Err(format!("v2 force note failed ({status}): {text}"));
+            }
+            Ok(())
         })?;
-        Ok(resp)
+        Ok(json!({
+            "action": "updated",
+            "nid": note.get("nid").and_then(Value::as_i64).unwrap_or(0),
+            "usn": 0,
+            "cards_added": [],
+            "cards_deleted": [],
+        }))
     }
 
     /// Update a local note to match a server note ("accept server"). `request`
@@ -3916,6 +3916,167 @@ fn apply_v2_deck(col: &mut Collection, record: &Value) -> Result<bool, String> {
     Ok(created)
 }
 
+fn v2_manifest_for_compare(manifest: &Value) -> Value {
+    let mut deck_names = manifest
+        .get("decks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|deck| deck.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for card in manifest
+        .get("cards")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = card.get("deck_name").and_then(Value::as_str) {
+            deck_names.insert(name.to_string());
+        }
+    }
+    let mut deck_names = deck_names.into_iter().collect::<Vec<_>>();
+    deck_names.sort_by_key(|name| name.to_lowercase());
+    let deck_ids = deck_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index as i64 + 1))
+        .collect::<HashMap<_, _>>();
+
+    let mut cards_by_note: HashMap<String, HashMap<String, i64>> = HashMap::new();
+    let mut deck_card_counts: HashMap<String, i64> = HashMap::new();
+    for card in manifest
+        .get("cards")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(guid) = card.get("note_guid").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(deck) = card.get("deck_name").and_then(Value::as_str) else {
+            continue;
+        };
+        *cards_by_note
+            .entry(guid.to_string())
+            .or_default()
+            .entry(deck.to_string())
+            .or_default() += 1;
+        *deck_card_counts.entry(deck.to_string()).or_default() += 1;
+    }
+
+    let mut deck_note_counts: HashMap<String, i64> = HashMap::new();
+    let mut deck_mods: HashMap<String, i64> = HashMap::new();
+    let notes = manifest
+        .get("notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, note)| {
+            let guid = note
+                .get("guid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let modified = note
+                .get("modified_at")
+                .and_then(Value::as_str)
+                .and_then(rfc3339_to_secs)
+                .unwrap_or(0);
+            let mut memberships = cards_by_note
+                .remove(&guid)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            memberships.sort_by_key(|(name, _)| name.to_lowercase());
+            let mut decks = Vec::with_capacity(memberships.len());
+            let mut cards_per_deck = Vec::with_capacity(memberships.len());
+            for (name, count) in memberships {
+                if let Some(did) = deck_ids.get(&name) {
+                    decks.push(*did);
+                    cards_per_deck.push(count);
+                    *deck_note_counts.entry(name.clone()).or_default() += 1;
+                    deck_mods
+                        .entry(name)
+                        .and_modify(|value| *value = (*value).max(modified))
+                        .or_insert(modified);
+                }
+            }
+            json!({
+                "guid": guid,
+                // v2 has no collection-local nid. A stable truthy placeholder
+                // keeps the existing detail controls available; detail lookup
+                // itself is GUID-based.
+                "nid": index as i64 + 1,
+                "mid": note.get("notetype_id").and_then(Value::as_i64).unwrap_or(0),
+                "mod": modified,
+                "decks": decks,
+                "cards_per_deck": cards_per_deck,
+                "hash": note.get("checksum").and_then(Value::as_str).unwrap_or(""),
+                "preview": guid,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let raw_decks = manifest
+        .get("decks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|deck| {
+            Some((
+                deck.get("name")?.as_str()?.to_string(),
+                deck.get("checksum")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                deck.get("modified_at")
+                    .and_then(Value::as_str)
+                    .and_then(rfc3339_to_secs)
+                    .unwrap_or(0),
+            ))
+        })
+        .map(|(name, checksum, modified)| (name, (checksum, modified)))
+        .collect::<HashMap<_, _>>();
+    let decks = deck_names
+        .iter()
+        .map(|name| {
+            let (hash, structural_mod) = raw_decks
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), 0));
+            json!({
+                "id": deck_ids.get(name).copied().unwrap_or(0),
+                "name": name,
+                "cards": deck_card_counts.get(name).copied().unwrap_or(0),
+                "notes": deck_note_counts.get(name).copied().unwrap_or(0),
+                "mod": deck_mods.get(name).copied().unwrap_or(structural_mod),
+                "hash": hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    let server_time = manifest
+        .get("server_time")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_to_secs)
+        .unwrap_or(0);
+    let media_files = manifest
+        .get("media")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    json!({
+        "ts": server_time,
+        "mod": server_time,
+        "scm": 0,
+        "usn": 0,
+        "schema": 2,
+        "decks": decks,
+        "notes": notes,
+        "media": { "usn": 0, "files": media_files },
+    })
+}
+
 fn ensure_v2_batch_without_conflicts(
     response: &Value,
     resource: &str,
@@ -4398,16 +4559,6 @@ fn rating_from_u64(value: u64) -> Result<Rating, String> {
 }
 
 /// Anki-compatible sync header for the Kelma-native inspect/write endpoints.
-fn inspect_header(hkey: &str) -> String {
-    json!({
-        "v": 11,
-        "k": hkey,
-        "c": kelma_client_label(),
-        "s": "",
-    })
-    .to_string()
-}
-
 /// Percent-encode a query/path value (Anki GUIDs contain URL-unsafe base91
 /// chars). Encodes everything that isn't an unreserved char.
 fn urlencode(s: &str) -> String {
@@ -4754,6 +4905,32 @@ mod v2_tests {
     }
 
     #[test]
+    fn adapts_v2_manifest_for_visible_comparison() {
+        let adapted = v2_manifest_for_compare(&json!({
+            "server_time": "2026-07-13T01:02:03Z",
+            "decks": [{
+                "name": "German", "checksum": "deck-checksum",
+                "modified_at": "2026-07-13T01:00:00Z"
+            }],
+            "notes": [{
+                "guid": "guid-1", "notetype_id": 42, "checksum": "note-checksum",
+                "modified_at": "2026-07-13T01:01:00Z"
+            }],
+            "cards": [{
+                "card_id": 99, "note_guid": "guid-1", "deck_name": "German", "ord": 0,
+                "modified_at": "2026-07-13T01:01:00Z"
+            }],
+            "media": [{"filename": "sound.mp3", "modified_at": "2026-07-13T01:00:00Z"}]
+        }));
+        assert_eq!(adapted["decks"][0]["name"], "German");
+        assert_eq!(adapted["decks"][0]["cards"], 1);
+        assert_eq!(adapted["decks"][0]["notes"], 1);
+        assert_eq!(adapted["notes"][0]["hash"], "note-checksum");
+        assert_eq!(adapted["notes"][0]["cards_per_deck"][0], 1);
+        assert_eq!(adapted["media"]["files"], 1);
+    }
+
+    #[test]
     fn normalizes_volatile_metadata() {
         let deck = normalize_v2_deck_config(&json!({
             "id": 123, "name": "Test", "mod": 456, "usn": -1,
@@ -4837,6 +5014,16 @@ mod v2_tests {
             }))
             .unwrap();
         let source_nid = added["noteId"].as_i64().unwrap();
+        let source_guid: String = source
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT guid FROM notes WHERE id=?", [source_nid], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
         let source_media = root.join("source/collection.media/ios-e2e.mp3");
         std::fs::create_dir_all(source_media.parent().unwrap()).unwrap();
         std::fs::write(&source_media, b"mobile-media-v1").unwrap();
@@ -4853,6 +5040,37 @@ mod v2_tests {
             "{}",
             stable["serverMessage"]
         );
+
+        // The visible comparison and its note detail/force controls must use
+        // v2 resources too; the legacy /sync/inspect API does not exist.
+        let visible = target.server_manifest(&auth).unwrap();
+        assert!(visible["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note["guid"].as_str() == Some(source_guid.as_str())));
+        assert!(visible["decks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|deck| deck["cards"].as_i64().unwrap_or(0) > 0));
+        let server_detail = target
+            .server_note_detail(&json!({
+                "hkey": token, "endpoint": endpoint, "guid": source_guid, "nid": 1
+            }))
+            .unwrap();
+        assert!(server_detail["flds"]
+            .as_str()
+            .unwrap()
+            .contains("mobile front"));
+        let local_detail = target
+            .local_note_detail(&json!({"guid": source_guid}))
+            .unwrap();
+        target
+            .write_server_note(&json!({
+                "hkey": token, "endpoint": endpoint, "note": local_detail
+            }))
+            .unwrap();
 
         // "Reset & download" is entirely local + v2: preserve auth, remove
         // local content/media/state, then restore without any Anki-wire route.

@@ -6,7 +6,7 @@ import {
 } from './KelmaCore';
 
 const deck = (name: string, hash: string, mod: number): DeckManifest => ({
-  id: 1,
+  id: [...name].reduce((sum, char) => sum + char.charCodeAt(0), 0),
   name,
   cards: 1,
   notes: 1,
@@ -21,7 +21,15 @@ const manifest = (decks: DeckManifest[]): Manifest => ({
   usn: 0,
   schema: 18,
   decks,
-  notes: [],
+  notes: decks.map((item, index) => ({
+    guid: `guid-${item.name}`,
+    nid: index + 1,
+    mid: 1,
+    mod: item.mod,
+    decks: [item.id],
+    cards_per_deck: [item.cards],
+    hash: item.hash,
+  })),
   media: { usn: 0, files: 0 },
 });
 
