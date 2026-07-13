@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   Alert,
   Linking,
+  Platform,
   Pressable,
   StatusBar,
   StyleSheet,
@@ -31,6 +32,9 @@ import { StatisticsScreen } from './src/screens/StatisticsScreen';
 import { SyncScreen } from './src/screens/SyncScreen';
 import { palette, radius, spacing } from './src/screens/theme';
 import { DeckIcon, SettingsIcon, StatsIcon, SyncIcon } from './src/screens/TabIcons';
+import { availableMobileUpdate } from './src/update';
+
+let updatePromptShown = false;
 
 type Boot =
   | { kind: 'loading' }
@@ -150,6 +154,36 @@ function App() {
   }, []);
 
   useEffect(start, [start]);
+
+  // AltStore owns installation on iOS, but the app still checks Kelma's
+  // versioned manifest and sends the user directly to the update page.
+  useEffect(() => {
+    if (boot.kind !== 'ready' || Platform.OS !== 'ios' || updatePromptShown) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      availableMobileUpdate()
+        .then(update => {
+          if (!update || updatePromptShown) return;
+          updatePromptShown = true;
+          Alert.alert(
+            `Kelma Mobile ${update.version} is available`,
+            'Open the Kelma AltStore page to install the verified new build.',
+            [
+              { text: 'Later', style: 'cancel' },
+              {
+                text: 'Open AltStore page',
+                onPress: () => Linking.openURL(update.notesUrl),
+              },
+            ],
+          );
+        })
+        .catch(() => {
+          // Startup update checks are intentionally silent when offline.
+        });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [boot.kind]);
 
   // --- Import from .apkg ---------------------------------------------------
   // Two entry points feed the same importer:

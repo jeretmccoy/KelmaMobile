@@ -4,9 +4,10 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
-import { SYNC_CLIENT_VERSION } from '../config';
+import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { MOBILE_APP_VERSION, SYNC_CLIENT_VERSION } from '../config';
 import { getSyncDebug, type SyncDebug } from '../core/KelmaCore';
+import { availableMobileUpdate } from '../update';
 import { headerStyles, palette, radius, shadow, spacing } from './theme';
 
 type Props = {
@@ -19,6 +20,7 @@ export function SettingsScreen({
   onAutoplayAudioChange,
 }: Props) {
   const [debug, setDebug] = useState<SyncDebug | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
 
   const loadDebug = () => {
     getSyncDebug()
@@ -27,6 +29,33 @@ export function SettingsScreen({
   };
 
   useEffect(loadDebug, []);
+
+  const checkForUpdate = () => {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    availableMobileUpdate()
+      .then(update => {
+        if (!update) {
+          Alert.alert('Kelma Mobile is up to date', `Version ${MOBILE_APP_VERSION} is installed.`);
+          return;
+        }
+        Alert.alert(
+          `Kelma Mobile ${update.version} is available`,
+          'AltStore performs iOS updates. Open the Kelma AltStore page now?',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open update page', onPress: () => Linking.openURL(update.notesUrl) },
+          ],
+        );
+      })
+      .catch(error =>
+        Alert.alert(
+          'Could not check for updates',
+          error instanceof Error ? error.message : String(error),
+        ),
+      )
+      .finally(() => setCheckingUpdate(false));
+  };
 
   return (
     <ScrollView
@@ -98,8 +127,21 @@ export function SettingsScreen({
 
       <Text style={styles.sectionLabel}>About</Text>
       <View style={styles.card}>
-        <Text style={styles.rowTitle}>Kelma Mobile 0.1.0</Text>
+        <Text style={styles.rowTitle}>Kelma Mobile {MOBILE_APP_VERSION}</Text>
         <Text style={styles.rowDescription}>{SYNC_CLIENT_VERSION}</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Check for Kelma Mobile updates"
+          disabled={checkingUpdate}
+          onPress={checkForUpdate}
+          style={({ pressed }) => [
+            styles.updateButton,
+            pressed && styles.updatePressed,
+          ]}>
+          <Text style={styles.updateText}>
+            {checkingUpdate ? 'Checking…' : 'Check for updates'}
+          </Text>
+        </Pressable>
         <Text style={styles.license}>AGPL-3.0-or-later</Text>
       </View>
     </ScrollView>
@@ -151,6 +193,17 @@ const styles = StyleSheet.create({
     marginTop: 5,
   },
   license: { color: palette.goldSoft, fontSize: 13, marginTop: 12 },
+  updateButton: {
+    alignSelf: 'flex-start',
+    borderColor: palette.surfaceBorder,
+    borderWidth: 1,
+    borderRadius: radius.md,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  updatePressed: { opacity: 0.7 },
+  updateText: { color: palette.textPrimary, fontSize: 13, fontWeight: '700' },
   refreshRow: {
     flexDirection: 'row',
     alignItems: 'center',
