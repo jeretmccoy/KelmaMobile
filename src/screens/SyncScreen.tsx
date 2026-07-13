@@ -28,6 +28,7 @@ import {
   getLocalNoteDetail,
   getServerManifest,
   getServerNoteDetail,
+  resetForV2Restore,
   resetMedia,
   syncCollection,
   syncLogin,
@@ -164,24 +165,19 @@ export function SyncScreen({ onSynced, onSignedIn, initialAuth, onSignedOut }: P
 
       // --- collection ---
       if (forceFullDownload) {
-        updateStep('collection', 'running', 'Downloading full collection from server…');
-        setStatus('Downloading the full collection…');
-        pushLog('Replacing local collection with the server copy…');
-        await fullSyncMonitored(credentials, false, onFull('Downloading collection…'));
-        updateStep('collection', 'done', 'Full collection downloaded from server');
-        pushLog('Full collection downloaded.', 'ok');
-        // A true reset: clear local media so the media phase DOWNLOADS the
-        // server's copy instead of pushing this device's files back up.
-        try {
-          pushLog('Clearing local media to download the server copy…');
-          await resetMedia();
-          pushLog('Local media cleared.', 'ok');
-        } catch {
-          pushLog(
-            'Could not clear local media — rebuild the app so reset downloads instead of uploads.',
-            'error',
-          );
+        updateStep('collection', 'running', 'Deleting local data safely…');
+        setStatus('Preparing a fresh KelmaSync restore…');
+        pushLog('Deleting local content/media while preserving your Kelma login…');
+        await resetForV2Restore();
+        pushLog('Local reset complete; restoring through KelmaSync v2…', 'ok');
+        updateStep('collection', 'running', 'Restoring collection from KelmaSync…');
+        setStatus('Restoring the collection from KelmaSync…');
+        const outcome = await syncCollectionWithConflictPrompts(credentials);
+        if (!outcome) {
+          throw new Error('Server restore was cancelled.');
         }
+        updateStep('collection', 'done', 'Collection restored from KelmaSync');
+        pushLog(`Collection restored through v2 (${outcome.required}).`, 'ok');
       } else {
         updateStep('collection', 'running', 'Checking collection changes…');
         setStatus('Syncing collection…');

@@ -1104,10 +1104,16 @@ export async function fullSync(
   await runOp('fullSync', { ...auth, upload });
 }
 
+/** Delete local collection content/media and v2 state while preserving the
+ * stored KelmaSync account. The next v2 collection sync is a server-authoritative
+ * fresh restore; no legacy Anki full-sync route is involved. */
+export async function resetForV2Restore(): Promise<void> {
+  await runOp('resetForV2Restore');
+}
+
 /**
  * Wipe this device's local media (files + media DB) so the next media sync has
- * nothing to push and instead downloads the server's copy. Used by "reset &
- * download from server" to make the media half download-only.
+ * nothing to push and instead downloads the server's copy.
  */
 export async function resetMedia(): Promise<void> {
   await runOp('resetMedia');

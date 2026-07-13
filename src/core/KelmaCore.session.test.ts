@@ -27,6 +27,7 @@ import {
   getStoredSyncAuth,
   openProfile,
   Rating,
+  resetForV2Restore,
   selectDeck,
   syncCollection,
   syncLogin,
@@ -173,6 +174,11 @@ describe('sync defaults to KelmaSync', () => {
       JSON.stringify({ hkey: 'abc', endpoint: DEFAULT_SYNC_ENDPOINT }),
     );
     expect(result).toEqual({ files: 123, bytes: 456789 });
+  });
+
+  it('resets local v2 content without invoking a server route', async () => {
+    await resetForV2Restore();
+    expect(native.runCollectionOp).toHaveBeenCalledWith('resetForV2Restore', '');
   });
 
   it('encodes the direction for a full sync', async () => {

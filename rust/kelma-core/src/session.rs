@@ -2945,6 +2945,120 @@ impl KelmaSession {
         }))
     }
 
+    /// Delete local collection content + media while preserving the collection
+    /// config row that stores KelmaSync auth. The next v2 sync sees a genuinely
+    /// fresh client, restores server structure/content, and cannot interpret the
+    /// reset as outgoing tombstones because the v2 snapshot is removed.
+    pub fn reset_for_v2_restore(&self) -> Result<Value, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "session poisoned".to_string())?;
+        let collection_path = guard.collection_path.clone();
+        let media_folder_path = guard.media_folder_path.clone();
+        let media_db_path = guard.media_db_path.clone();
+
+        let (notes_removed, cards_removed, decks_removed) = {
+            let col = guard
+                .col
+                .as_mut()
+                .ok_or_else(|| "collection not open".to_string())?;
+            let note_ids: Vec<i64> = col
+                .storage
+                .db()
+                .prepare("SELECT id FROM notes")
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<i64>>>()
+                })
+                .map_err(|e| format!("list notes for reset: {e}"))?;
+            for chunk in note_ids.chunks(1000) {
+                let ids = chunk.iter().copied().map(NoteId).collect::<Vec<_>>();
+                col.remove_notes(&ids)
+                    .map_err(|e| format!("remove notes for reset: {e:?}"))?;
+            }
+
+            let card_ids: Vec<i64> = col
+                .storage
+                .db()
+                .prepare("SELECT id FROM cards")
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<i64>>>()
+                })
+                .map_err(|e| format!("list remaining cards for reset: {e}"))?;
+            for chunk in card_ids.chunks(1000) {
+                let _ = col
+                    .remove_cards(anki_proto::cards::RemoveCardsRequest {
+                        card_ids: chunk.to_vec(),
+                    })
+                    .map_err(|e| format!("remove remaining cards for reset: {e:?}"))?;
+            }
+
+            let deck_ids: Vec<i64> = col
+                .storage
+                .db()
+                .prepare("SELECT id FROM decks WHERE id != 1 ORDER BY id DESC")
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<i64>>>()
+                })
+                .map_err(|e| format!("list decks for reset: {e}"))?;
+            if !deck_ids.is_empty() {
+                let ids = deck_ids.iter().copied().map(DeckId).collect::<Vec<_>>();
+                col.remove_decks_and_child_decks(&ids)
+                    .map_err(|e| format!("remove decks for reset: {e:?}"))?;
+            }
+            // These native sync graves describe the local wipe, not user intent.
+            col.storage.db().execute("DELETE FROM graves", []).ok();
+            (note_ids.len(), card_ids.len(), deck_ids.len())
+        };
+
+        // Close media handles before clearing files/state, then reopen the same
+        // collection database. kelmaSyncAuth remains in its config table.
+        guard.col.take();
+        let media_dir = std::path::Path::new(&media_folder_path);
+        if media_dir.exists() {
+            for entry in std::fs::read_dir(media_dir).map_err(|e| format!("read media dir: {e}"))? {
+                let entry = entry.map_err(|e| format!("read media entry: {e}"))?;
+                if entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+                {
+                    std::fs::remove_file(entry.path())
+                        .map_err(|e| format!("remove media file: {e}"))?;
+                }
+            }
+        } else {
+            std::fs::create_dir_all(media_dir).map_err(|e| format!("create media dir: {e}"))?;
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{media_db_path}{suffix}"));
+        }
+        for path in [
+            v2_state_path(&collection_path),
+            format!("{}.tmp", v2_state_path(&collection_path)),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        guard.col = Some(build_collection(
+            &collection_path,
+            &media_folder_path,
+            &media_db_path,
+        )?);
+        Ok(json!({
+            "reset": true,
+            "notesRemoved": notes_removed,
+            "cardsRemoved": cards_removed,
+            "decksRemoved": decks_removed,
+        }))
+    }
+
     /// Wipe this device's local media: delete every file in the media folder and
     /// the media DB (so media-sync state resets to empty), then reopen. After
     /// this, a media sync has nothing local to push and downloads the server's
@@ -4739,6 +4853,30 @@ mod v2_tests {
             "{}",
             stable["serverMessage"]
         );
+
+        // "Reset & download" is entirely local + v2: preserve auth, remove
+        // local content/media/state, then restore without any Anki-wire route.
+        target.set_sync_auth(&auth).unwrap();
+        let reset = target.reset_for_v2_restore().unwrap();
+        assert_eq!(reset["reset"], true);
+        assert_eq!(target.get_sync_auth().unwrap()["hkey"], token);
+        let empty: (i64, i64) = target
+            .with_col_result(|col| {
+                let db = col.storage.db();
+                let notes = db
+                    .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                let cards = db
+                    .query_row("SELECT count(*) FROM cards", [], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                Ok((notes, cards))
+            })
+            .unwrap();
+        assert_eq!(empty, (0, 0));
+        assert!(!target_media.exists());
+        target.sync_collection(&auth).unwrap();
+        target.sync_media(&auth).unwrap();
+        assert_eq!(std::fs::read(&target_media).unwrap(), b"mobile-media-v1");
 
         // Same-name server replacements must invalidate the downloaded-media
         // baseline and overwrite the stale local file.
