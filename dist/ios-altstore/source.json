@@ -12,17 +12,25 @@
       "iconURL": "https://kelma.tech/altstore/icon.png",
       "tintColor": "0D9488",
       "category": "education",
-      "version": "1.1.2",
+      "version": "1.1.3",
       "versionDate": "2026-07-12",
       "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
-      "size": 13594069,
-      "sha256": "788e7411f24eb8cc99428539f28b9521e51f977660ddcf2f14f9f31c1e26cc9f",
+      "size": 13581111,
+      "sha256": "e63b85d00773795105662fb1ee3ccbaa5bf92b7d1cf8de9aae46e5cec3067f5b",
       "versions": [
+        {
+          "version": "1.1.3",
+          "date": "2026-07-12",
+          "localizedDescription": "Fixes Compare with server by moving its deck/note manifest, note detail, Accept server, and Force local actions entirely to KelmaSync v2 instead of removed legacy inspect routes.",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "size": 13581111,
+          "sha256": "e63b85d00773795105662fb1ee3ccbaa5bf92b7d1cf8de9aae46e5cec3067f5b"
+        },
         {
           "version": "1.1.2",
           "date": "2026-07-12",
           "localizedDescription": "Fixes Reset & Download: local content, media, and v2 state are deleted on-device while login is preserved, then the collection is restored exclusively through KelmaSync v2 without calling a legacy API route.",
-          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.2.ipa",
           "size": 13594069,
           "sha256": "788e7411f24eb8cc99428539f28b9521e51f977660ddcf2f14f9f31c1e26cc9f"
         },
