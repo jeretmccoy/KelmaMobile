@@ -14,8 +14,8 @@ const deck = (name: string, hash: string, mod: number): DeckManifest => ({
   hash,
 });
 
-const manifest = (decks: DeckManifest[]): Manifest => ({
-  ts: 0,
+const manifest = (decks: DeckManifest[], serverTime = 0): Manifest => ({
+  ts: serverTime,
   mod: 0,
   scm: 0,
   usn: 0,
@@ -88,5 +88,18 @@ describe('diffManifests', () => {
     const server = manifest([deck('Deck', 'server', 10)]);
 
     expect(diffManifests(local, server)[0].status).toBe('conflict');
+  });
+
+  it('uses server UTC when a future local clock would hide upstream cards', () => {
+    const serverTime = 1_783_900_800;
+    const local = manifest([
+      deck('Immersion', 'local', serverTime + 4 * 60 * 60),
+    ]);
+    const server = manifest(
+      [deck('Immersion', 'server', serverTime - 30)],
+      serverTime,
+    );
+
+    expect(diffManifests(local, server)[0].status).toBe('server-newer');
   });
 });

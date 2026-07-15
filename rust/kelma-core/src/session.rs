@@ -1476,12 +1476,7 @@ impl KelmaSession {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
             .join(" ");
-        let modified = note
-            .get("client_modified_at")
-            .or_else(|| note.get("modified_at"))
-            .and_then(Value::as_str)
-            .and_then(rfc3339_to_secs)
-            .unwrap_or(0);
+        let modified = v2_server_modified_secs(&note, None);
         Ok(json!({
             "guid": guid,
             "nid": request.get("nid").and_then(Value::as_i64).unwrap_or(0),
@@ -1688,6 +1683,14 @@ impl KelmaSession {
         let pushed_deletions =
             push_v2_pending_deletes(endpoint, token, &collection_path, &mut previous_state)?;
         let manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
+        // KelmaSync's authenticated UTC clock is authoritative for newest-wins.
+        // Device/collection clocks can be wrong (or legacy records may have
+        // been interpreted in local time), so they must not outrank a valid
+        // upstream record merely by being implausibly far in the future.
+        let server_utc_now = manifest
+            .get("server_time")
+            .and_then(Value::as_str)
+            .and_then(rfc3339_to_secs);
         let deleted = self.with_col_result(|col| {
             apply_v2_tombstones(
                 col,
@@ -1827,15 +1830,10 @@ impl KelmaSession {
                 continue;
             };
             let server_checksum = card.get("checksum").and_then(Value::as_str).unwrap_or("");
-            let server_modified = card
-                .get("client_modified_at")
-                .and_then(Value::as_str)
-                .unwrap_or("");
             let structural_difference = server_checksum != local.checksum;
-            let server_is_newer = rfc3339_to_secs(server_modified).unwrap_or(0)
-                > rfc3339_to_secs(&local.modified).unwrap_or(0);
-            let local_is_newer = rfc3339_to_secs(&local.modified).unwrap_or(0)
-                > rfc3339_to_secs(server_modified).unwrap_or(0);
+            let newest = v2_newest_side(&local.modified, &card, server_utc_now);
+            let server_is_newer = newest == Some(V2NewestSide::Server);
+            let local_is_newer = newest == Some(V2NewestSide::Local);
             let pull = if structural_difference && local.usn == -1 {
                 if server_is_newer || conflict_policy == "server" {
                     true
@@ -1982,20 +1980,10 @@ impl KelmaSession {
                 note_apply_guids.insert(guid.to_string());
                 continue;
             }
-            let server_modified = note
-                .get("client_modified_at")
-                .or_else(|| note.get("modified_at"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if rfc3339_to_secs(server_modified).unwrap_or(0)
-                > rfc3339_to_secs(&local.modified).unwrap_or(0)
-                || conflict_policy == "server"
-            {
+            let newest = v2_newest_side(&local.modified, note, server_utc_now);
+            if newest == Some(V2NewestSide::Server) || conflict_policy == "server" {
                 note_apply_guids.insert(guid.to_string());
-            } else if rfc3339_to_secs(&local.modified).unwrap_or(0)
-                > rfc3339_to_secs(server_modified).unwrap_or(0)
-                || conflict_policy == "local"
-            {
+            } else if newest == Some(V2NewestSide::Local) || conflict_policy == "local" {
                 // Keep the pending local version; it is pushed below using the
                 // manifest checksum as its optimistic-concurrency base.
             } else {
@@ -2029,7 +2017,7 @@ impl KelmaSession {
         let mut created_decks = 0usize;
         let mut applied_decks = 0usize;
         for deck in &pulled_decks {
-            if apply_v2_deck(col, deck)? {
+            if apply_v2_deck(col, deck, server_utc_now)? {
                 created_decks += 1;
             }
             applied_decks += 1;
@@ -2055,12 +2043,7 @@ impl KelmaSession {
                 if let Some(name) = nt.get("name").and_then(Value::as_str) {
                     obj.insert("name".to_string(), json!(name));
                 }
-                let modified = nt
-                    .get("client_modified_at")
-                    .or_else(|| nt.get("modified_at"))
-                    .and_then(Value::as_str)
-                    .and_then(rfc3339_to_secs)
-                    .unwrap_or(0);
+                let modified = v2_server_modified_secs(nt, server_utc_now);
                 obj.insert("mod".to_string(), json!(modified));
                 obj.insert("usn".to_string(), json!(0));
             }
@@ -2120,12 +2103,7 @@ impl KelmaSession {
                 .into_iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect::<Vec<_>>();
-            let modified = note
-                .get("client_modified_at")
-                .or_else(|| note.get("modified_at"))
-                .and_then(Value::as_str)
-                .and_then(rfc3339_to_secs)
-                .unwrap_or(0);
+            let modified = v2_server_modified_secs(note, server_utc_now);
 
             if let Some(nid) = existing {
                 let _ = col
@@ -2251,12 +2229,7 @@ impl KelmaSession {
             } else {
                 s_i64("odue")
             };
-            let modified = card
-                .get("client_modified_at")
-                .or_else(|| card.get("modified_at"))
-                .and_then(Value::as_str)
-                .and_then(rfc3339_to_secs)
-                .unwrap_or(0);
+            let modified = v2_server_modified_secs(card, server_utc_now);
             col.storage.db().execute(
                 "UPDATE cards SET did=?, type=?, queue=?, due=?, ivl=?, factor=?, reps=?, lapses=?, left=?, odue=?, odid=?, flags=?, data=?, mod=?, usn=0 WHERE id=?",
                 rusqlite::params![
@@ -3871,7 +3844,11 @@ fn prepare_v2_notetype_slot(
     Ok(())
 }
 
-fn apply_v2_deck(col: &mut Collection, record: &Value) -> Result<bool, String> {
+fn apply_v2_deck(
+    col: &mut Collection,
+    record: &Value,
+    server_utc_now: Option<i64>,
+) -> Result<bool, String> {
     let name = record
         .get("name")
         .and_then(Value::as_str)
@@ -3883,12 +3860,7 @@ fn apply_v2_deck(col: &mut Collection, record: &Value) -> Result<bool, String> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let modified = record
-        .get("client_modified_at")
-        .or_else(|| record.get("modified_at"))
-        .and_then(Value::as_str)
-        .and_then(rfc3339_to_secs)
-        .unwrap_or(0);
+    let modified = v2_server_modified_secs(record, server_utc_now);
     value.insert("id".to_string(), json!(did.0));
     value.insert("name".to_string(), json!(name));
     value.insert("mod".to_string(), json!(modified));
@@ -4202,6 +4174,76 @@ fn rfc3339_to_secs(value: &str) -> Option<i64> {
         secs -= sign * (offset_hour * 3600 + offset_minute * 60);
     }
     Some(secs.max(0))
+}
+
+const V2_MAX_FUTURE_CLOCK_SKEW_SECS: i64 = 5 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V2NewestSide {
+    Local,
+    Server,
+}
+
+/// Return the server record's normalized UTC source time. `modified_at` is the
+/// trusted time KelmaSync accepted the write; `client_modified_at` is preferred
+/// only while it remains plausible relative to that receipt and the manifest's
+/// authenticated `server_time`.
+fn v2_server_modified_secs(record: &Value, server_utc_now: Option<i64>) -> i64 {
+    let receipt_time = record
+        .get("modified_at")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_to_secs)
+        .unwrap_or(0);
+    let mut source_time = record
+        .get("client_modified_at")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_to_secs)
+        .filter(|value| *value > 0)
+        .unwrap_or(receipt_time);
+    let reference_time = server_utc_now
+        .filter(|value| *value > 0)
+        .or((receipt_time > 0).then_some(receipt_time));
+
+    if let Some(reference_time) = reference_time {
+        let ceiling = reference_time.saturating_add(V2_MAX_FUTURE_CLOCK_SKEW_SECS);
+        if source_time > ceiling {
+            source_time = if receipt_time > 0 && receipt_time <= ceiling {
+                receipt_time
+            } else {
+                0
+            };
+        }
+    }
+    source_time
+}
+
+/// Compare a local Anki integer `mod` timestamp with a server resource using
+/// KelmaSync's UTC clock. If the local clock is implausibly in the future, a
+/// valid upstream copy wins instead of being blocked or overwritten forever.
+fn v2_newest_side(
+    local_modified: &str,
+    server: &Value,
+    server_utc_now: Option<i64>,
+) -> Option<V2NewestSide> {
+    let mut local_time = rfc3339_to_secs(local_modified).unwrap_or(0);
+    let server_time = v2_server_modified_secs(server, server_utc_now);
+    let local_is_future = server_utc_now
+        .filter(|value| *value > 0)
+        .is_some_and(|now| local_time > now.saturating_add(V2_MAX_FUTURE_CLOCK_SKEW_SECS));
+    if local_is_future {
+        local_time = 0;
+        if server_time > 0 {
+            return Some(V2NewestSide::Server);
+        }
+    }
+    if local_time <= 0 || server_time <= 0 || local_time == server_time {
+        return None;
+    }
+    Some(if local_time > server_time {
+        V2NewestSide::Local
+    } else {
+        V2NewestSide::Server
+    })
 }
 
 /// Format a unix-seconds timestamp as an RFC3339 UTC string, matching the
@@ -4901,6 +4943,44 @@ mod v2_tests {
         assert_eq!(
             rfc3339_to_secs("2026-07-12T01:02:03.123456Z"),
             rfc3339_to_secs("2026-07-12T01:02:03Z")
+        );
+        assert_eq!(
+            rfc3339_to_secs("2026-07-11T21:02:03-04:00"),
+            rfc3339_to_secs("2026-07-12T01:02:03Z")
+        );
+    }
+
+    #[test]
+    fn manifest_utc_clock_rejects_future_local_winner() {
+        let utc_now = rfc3339_to_secs("2026-07-15T00:00:00Z").unwrap();
+        let server = json!({
+            "client_modified_at": "2026-07-14T23:59:00Z",
+            "modified_at": "2026-07-14T23:59:30Z",
+        });
+        assert_eq!(
+            v2_newest_side("2026-07-15T04:00:00Z", &server, Some(utc_now)),
+            Some(V2NewestSide::Server)
+        );
+        assert_eq!(
+            v2_newest_side("2026-07-14T23:58:00Z", &server, Some(utc_now)),
+            Some(V2NewestSide::Server)
+        );
+        assert_eq!(
+            v2_newest_side("2026-07-15T00:00:00Z", &server, Some(utc_now)),
+            Some(V2NewestSide::Local)
+        );
+    }
+
+    #[test]
+    fn future_server_source_falls_back_to_utc_receipt_time() {
+        let utc_now = rfc3339_to_secs("2026-07-15T00:00:00Z").unwrap();
+        let server = json!({
+            "client_modified_at": "2026-07-16T00:00:00Z",
+            "modified_at": "2026-07-14T23:59:30Z",
+        });
+        assert_eq!(
+            v2_server_modified_secs(&server, Some(utc_now)),
+            rfc3339_to_secs("2026-07-14T23:59:30Z").unwrap()
         );
     }
 

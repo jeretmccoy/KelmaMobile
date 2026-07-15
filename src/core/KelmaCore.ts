@@ -783,6 +783,30 @@ export type NoteDiff = {
   server?: NoteManifest;
 };
 
+const MAX_FUTURE_SYNC_CLOCK_SKEW_SECONDS = 5 * 60;
+
+type NewestManifestSide = 'local' | 'server';
+
+/** Compare integer UTC modification epochs using the authenticated server
+ * manifest clock. A local collection clock far in the future must not make an
+ * upstream Immersion card appear stale forever. */
+function newestManifestSide(
+  localMod: number,
+  serverMod: number,
+  serverUtcNow: number,
+): NewestManifestSide | null {
+  const localIsFuture =
+    serverUtcNow > 0 &&
+    localMod > serverUtcNow + MAX_FUTURE_SYNC_CLOCK_SKEW_SECONDS;
+  if (localIsFuture) {
+    return serverMod > 0 ? 'server' : null;
+  }
+  if (localMod <= 0 || serverMod <= 0 || localMod === serverMod) {
+    return null;
+  }
+  return localMod > serverMod ? 'local' : 'server';
+}
+
 /** Diff two manifests deck-by-deck (keyed by name, since ids differ across
  *  collections). Returns one entry per deck that exists on either side. */
 function deckContentSignature(manifest: Manifest, deckId: number): string {
@@ -807,12 +831,15 @@ export function diffManifests(local: Manifest, server: Manifest): DeckDiff[] {
     if (l && s) {
       if (deckContentSignature(local, l.id) === deckContentSignature(server, s.id)) {
         diffs.push({ status: 'in-sync', deck: l });
-      } else if (l.mod > s.mod) {
-        diffs.push({ status: 'local-newer', deck: l, server: s });
-      } else if (s.mod > l.mod) {
-        diffs.push({ status: 'server-newer', deck: s, local: l });
       } else {
-        diffs.push({ status: 'conflict', deck: l, server: s });
+        const newest = newestManifestSide(l.mod, s.mod, server.ts);
+        if (newest === 'local') {
+          diffs.push({ status: 'local-newer', deck: l, server: s });
+        } else if (newest === 'server') {
+          diffs.push({ status: 'server-newer', deck: s, local: l });
+        } else {
+          diffs.push({ status: 'conflict', deck: l, server: s });
+        }
       }
     } else if (s) {
       diffs.push({ status: 'server-only', deck: s });
@@ -841,7 +868,13 @@ function groupNotesByGuid(notes: NoteManifest[], deckId: number): Map<string, No
   return out;
 }
 
-function noteStatus(local: NoteManifest | undefined, server: NoteManifest | undefined, localDeckId: number, serverDeckId: number): NoteDiffStatus {
+function noteStatus(
+  local: NoteManifest | undefined,
+  server: NoteManifest | undefined,
+  localDeckId: number,
+  serverDeckId: number,
+  serverUtcNow: number,
+): NoteDiffStatus {
   if (local && server) {
     const fieldsMatch = local.hash === server.hash;
     if (fieldsMatch) {
@@ -849,8 +882,9 @@ function noteStatus(local: NoteManifest | undefined, server: NoteManifest | unde
         ? 'card-count'
         : 'in-sync';
     }
-    if (local.mod > server.mod) return 'local-newer';
-    if (server.mod > local.mod) return 'server-newer';
+    const newest = newestManifestSide(local.mod, server.mod, serverUtcNow);
+    if (newest === 'local') return 'local-newer';
+    if (newest === 'server') return 'server-newer';
     return 'conflict';
   }
   return local ? 'local-only' : 'server-only';
@@ -871,7 +905,15 @@ export function diffDeckNotes(local: Manifest, server: Manifest, deckDiff: DeckD
     out.push({
       guid,
       preview: note?.preview || '(no preview)',
-      status: statusOverride ?? noteStatus(localNote, serverNote, localDeck.id, serverDeck.id),
+      status:
+        statusOverride ??
+        noteStatus(
+          localNote,
+          serverNote,
+          localDeck.id,
+          serverDeck.id,
+          server.ts,
+        ),
       local: localNote,
       server: serverNote,
     });
