@@ -134,8 +134,8 @@ android {
         manifestPlaceholders += [appLabel: directDistribution ? "Kelma Direct" : "Kelma"]
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1001005
-        versionName "1.1.5"
+        versionCode 1001006
+        versionName "1.1.6"
     }
     signingConfigs {
         directRelease {

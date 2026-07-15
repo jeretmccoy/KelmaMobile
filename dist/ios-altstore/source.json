@@ -12,17 +12,25 @@
       "iconURL": "https://kelma.tech/altstore/icon.png",
       "tintColor": "0D9488",
       "category": "education",
-      "version": "1.1.4",
-      "versionDate": "2026-07-12",
+      "version": "1.1.6",
+      "versionDate": "2026-07-15",
       "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
-      "size": 13584624,
-      "sha256": "ab02307f9cef87ed3010eda50d6b1a29750d0a41bd7c34d2d71b3c93b91143d5",
+      "size": 13599192,
+      "sha256": "68c4a30ababd29644d4fcf74b765834843fc76f80938dc705611ded708c54aee",
       "versions": [
+        {
+          "version": "1.1.6",
+          "date": "2026-07-15",
+          "localizedDescription": "Uses KelmaSync's authoritative UTC clock during reconciliation so new and updated cards created in Kelma Immersion are not hidden by a future-skewed local collection timestamp. The Compare screen now follows the same UTC conflict policy.",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "size": 13599192,
+          "sha256": "68c4a30ababd29644d4fcf74b765834843fc76f80938dc705611ded708c54aee"
+        },
         {
           "version": "1.1.4",
           "date": "2026-07-12",
           "localizedDescription": "Adds automatic update discovery at startup and a manual Check for updates control. AltStore remains responsible for the verified iOS installation.",
-          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.4.ipa",
           "size": 13584624,
           "sha256": "ab02307f9cef87ed3010eda50d6b1a29750d0a41bd7c34d2d71b3c93b91143d5"
         },

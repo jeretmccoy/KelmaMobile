@@ -1,0 +1,3 @@
+Fixes KelmaSync v2 reconciliation to use the server's authoritative UTC clock.
+New and updated cards created in Kelma Immersion are no longer hidden by a future-skewed local collection timestamp.
+Aligns the Compare screen with the same UTC conflict policy.
