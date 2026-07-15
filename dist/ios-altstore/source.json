@@ -14,7 +14,7 @@
       "category": "education",
       "version": "1.1.6",
       "versionDate": "2026-07-15",
-      "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+      "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.6.ipa",
       "size": 13599192,
       "sha256": "68c4a30ababd29644d4fcf74b765834843fc76f80938dc705611ded708c54aee",
       "versions": [
@@ -22,7 +22,7 @@
           "version": "1.1.6",
           "date": "2026-07-15",
           "localizedDescription": "Uses KelmaSync's authoritative UTC clock during reconciliation so new and updated cards created in Kelma Immersion are not hidden by a future-skewed local collection timestamp. The Compare screen now follows the same UTC conflict policy.",
-          "downloadURL": "https://kelma.tech/altstore/KelmaMobile.ipa",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.6.ipa",
           "size": 13599192,
           "sha256": "68c4a30ababd29644d4fcf74b765834843fc76f80938dc705611ded708c54aee"
         },
