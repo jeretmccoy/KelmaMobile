@@ -1,0 +1,3 @@
+Syncs complete Anki review history between KelmaMobile and KelmaDesktop.
+Daily new/review limits now follow you across devices instead of reopening a second study batch.
+Fresh server restores also recover review statistics and FSRS training history.

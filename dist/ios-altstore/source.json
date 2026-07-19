@@ -12,12 +12,20 @@
       "iconURL": "https://kelma.tech/altstore/icon.png",
       "tintColor": "0D9488",
       "category": "education",
-      "version": "1.1.6",
-      "versionDate": "2026-07-15",
-      "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.6.ipa",
-      "size": 13599192,
-      "sha256": "68c4a30ababd29644d4fcf74b765834843fc76f80938dc705611ded708c54aee",
+      "version": "1.1.7",
+      "versionDate": "2026-07-19",
+      "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.7.ipa",
+      "size": 13625432,
+      "sha256": "f6933fccab8e7622bc159dd68f9db24c8ae643f444b06e3294f0dc3521bd47cc",
       "versions": [
+        {
+          "version": "1.1.7",
+          "date": "2026-07-19",
+          "localizedDescription": "Syncs complete Anki review history and daily study limits across KelmaMobile and KelmaDesktop. New and restored devices recover review statistics, study time, and FSRS training history.",
+          "downloadURL": "https://kelma.tech/altstore/KelmaMobile-1.1.7.ipa",
+          "size": 13625432,
+          "sha256": "f6933fccab8e7622bc159dd68f9db24c8ae643f444b06e3294f0dc3521bd47cc"
+        },
         {
           "version": "1.1.6",
           "date": "2026-07-15",

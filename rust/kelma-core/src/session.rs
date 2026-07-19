@@ -1683,6 +1683,7 @@ impl KelmaSession {
         let pushed_deletions =
             push_v2_pending_deletes(endpoint, token, &collection_path, &mut previous_state)?;
         let manifest = v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?;
+        let review_sync_supported = manifest.get("reviews").is_some();
         // KelmaSync's authenticated UTC clock is authoritative for newest-wins.
         // Device/collection clocks can be wrong (or legacy records may have
         // been interpreted in local time), so they must not outrank a valid
@@ -1704,83 +1705,99 @@ impl KelmaSession {
         // Build local canonical note/card hashes in two SQL scans. Existing
         // resources are compared too: mobile must pull server edits, not only
         // resources missing from a fresh collection.
-        let (local_notes, local_cards, local_notetypes, local_decks) =
-            self.with_col_result(|col| {
-                let notes = {
-                    let db = col.storage.db();
-                    let mut notes = HashMap::new();
-                    let mut stmt = db
-                        .prepare("SELECT guid, mod, usn, flds, tags FROM notes WHERE guid <> ''")
-                        .map_err(|e| format!("prepare local notes: {e}"))?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, String>(4)?,
-                            ))
-                        })
-                        .map_err(|e| format!("query local notes: {e}"))?;
-                    for (guid, modified, usn, fields, tags) in rows.filter_map(Result::ok) {
-                        let fields = fields
-                            .split('\u{1f}')
-                            .map(str::to_string)
-                            .collect::<Vec<_>>();
-                        let tags = tags
-                            .split_whitespace()
-                            .map(str::to_string)
-                            .collect::<Vec<_>>();
-                        notes.insert(
-                            guid,
-                            LocalV2Note {
-                                checksum: v2_note_checksum(&fields, &tags),
-                                modified: rfc3339_from_secs(modified),
-                                usn,
-                            },
-                        );
-                    }
-                    notes
-                };
+        let (
+            local_notes,
+            local_cards,
+            local_notetypes,
+            local_decks,
+            local_reviews,
+            local_study_days,
+        ) = self.with_col_result(|col| {
+            let notes = {
+                let db = col.storage.db();
+                let mut notes = HashMap::new();
+                let mut stmt = db
+                    .prepare("SELECT guid, mod, usn, flds, tags FROM notes WHERE guid <> ''")
+                    .map_err(|e| format!("prepare local notes: {e}"))?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    })
+                    .map_err(|e| format!("query local notes: {e}"))?;
+                for (guid, modified, usn, fields, tags) in rows.filter_map(Result::ok) {
+                    let fields = fields
+                        .split('\u{1f}')
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let tags = tags
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    notes.insert(
+                        guid,
+                        LocalV2Note {
+                            checksum: v2_note_checksum(&fields, &tags),
+                            modified: rfc3339_from_secs(modified),
+                            usn,
+                        },
+                    );
+                }
+                notes
+            };
 
-                let cards = {
-                    let db = col.storage.db();
-                    let mut cards = HashMap::new();
-                    let mut stmt = db
-                        .prepare(
-                            "SELECT n.guid, c.ord, d.name, c.mod, c.usn FROM cards c \
+            let cards = {
+                let db = col.storage.db();
+                let mut cards = HashMap::new();
+                let mut stmt = db
+                    .prepare(
+                        "SELECT n.guid, c.ord, d.name, c.mod, c.usn FROM cards c \
                          JOIN notes n ON n.id=c.nid JOIN decks d ON d.id=c.did \
                          WHERE n.guid <> ''",
-                        )
-                        .map_err(|e| format!("prepare local cards: {e}"))?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, i64>(4)?,
-                            ))
-                        })
-                        .map_err(|e| format!("query local cards: {e}"))?;
-                    for (guid, ord, deck, modified, usn) in rows.filter_map(Result::ok) {
-                        cards.insert(
-                            format!("{guid}:{ord}"),
-                            LocalV2Card {
-                                checksum: v2_card_checksum(&guid, &deck, ord),
-                                modified: rfc3339_from_secs(modified),
-                                usn,
-                            },
-                        );
-                    }
-                    cards
-                };
-                let notetypes = local_v2_notetype_checksums(col)?;
-                let decks = local_v2_deck_checksums(col)?;
-                Ok((notes, cards, notetypes, decks))
-            })?;
+                    )
+                    .map_err(|e| format!("prepare local cards: {e}"))?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })
+                    .map_err(|e| format!("query local cards: {e}"))?;
+                for (guid, ord, deck, modified, usn) in rows.filter_map(Result::ok) {
+                    cards.insert(
+                        format!("{guid}:{ord}"),
+                        LocalV2Card {
+                            checksum: v2_card_checksum(&guid, &deck, ord),
+                            modified: rfc3339_from_secs(modified),
+                            usn,
+                        },
+                    );
+                }
+                cards
+            };
+            let notetypes = local_v2_notetype_checksums(col)?;
+            let decks = local_v2_deck_checksums(col)?;
+            let reviews = if review_sync_supported {
+                local_v2_reviews(col)?
+            } else {
+                HashMap::new()
+            };
+            let study_days = if review_sync_supported {
+                local_v2_study_days(col)?
+            } else {
+                Vec::new()
+            };
+            Ok((notes, cards, notetypes, decks, reviews, study_days))
+        })?;
 
         let server_notes = manifest
             .get("notes")
@@ -1892,6 +1909,54 @@ impl KelmaSession {
             .filter_map(|d| d.get("name").and_then(Value::as_str).map(str::to_string))
             .collect::<Vec<_>>();
 
+        // Review history is append-only. Presence of the manifest key is the
+        // capability marker, so an upgraded mobile client can still talk to an
+        // older self-hosted server without sending unknown batch fields.
+        let server_review_checksums = manifest
+            .get("reviews")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|review| {
+                Some((
+                    review.get("review_id")?.as_i64()?,
+                    review.get("checksum")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut review_conflicts = Vec::new();
+        for (review_id, server_checksum) in &server_review_checksums {
+            if let Some(local) = local_reviews.get(review_id) {
+                let still_has_portable_card = !local.note_guid.is_empty();
+                // Anki deliberately retains revlog rows after a card/note is
+                // deleted. Once orphaned, the local DB no longer contains the
+                // GUID needed to reproduce the portable checksum; retain the
+                // server's already-known identity instead of inventing a
+                // conflict for immutable history.
+                if still_has_portable_card
+                    && !server_checksum.is_empty()
+                    && local.checksum != *server_checksum
+                {
+                    review_conflicts.push(*review_id);
+                }
+            }
+        }
+        if !review_conflicts.is_empty() {
+            return Err(format!(
+                "KELMA_CONTENT_CONFIRM:review history {}",
+                review_conflicts
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let server_review_ids = server_review_checksums
+            .keys()
+            .filter(|review_id| !local_reviews.contains_key(review_id))
+            .copied()
+            .collect::<Vec<_>>();
+
         let mut pulled_notes = Vec::<Value>::new();
         for chunk in server_note_guids.chunks(3000) {
             let resp = v2_json(
@@ -1963,6 +2028,27 @@ impl KelmaSession {
                     .cloned()
                     .unwrap_or_default(),
             );
+        }
+        let mut pulled_reviews = Vec::<Value>::new();
+        if review_sync_supported {
+            for chunk in server_review_ids.chunks(3000) {
+                let resp = v2_json(
+                    "POST",
+                    endpoint,
+                    "/v2/batch/pull",
+                    Some(token),
+                    Some(json!({
+                        "notes": [], "cards": [], "reviews": chunk,
+                        "notetypes": [], "decks": []
+                    })),
+                )?;
+                pulled_reviews.extend(
+                    resp.get("reviews")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
         }
 
         let mut note_apply_guids = HashSet::new();
@@ -2242,6 +2328,25 @@ impl KelmaSession {
             applied_cards += 1;
         }
 
+        let (review_card_ids, occupied_card_ids) = v2_review_card_map(col)?;
+        let mut applied_reviews = 0usize;
+        for review in &pulled_reviews {
+            if apply_v2_review(col, review, &review_card_ids, &occupied_card_ids)? {
+                applied_reviews += 1;
+            }
+        }
+        let server_study_days = manifest
+            .get("study_days")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let merged_study_days = if review_sync_supported {
+            merged_v2_study_days(&server_study_days, &local_study_days)
+        } else {
+            Vec::new()
+        };
+        let applied_study_days = apply_v2_study_days(col, &merged_study_days)?;
+
         // --- Upload local changes (usn = -1 marks rows changed since last sync,
         // e.g. a card answered during review, or a note edited on device). ---
 
@@ -2379,6 +2484,29 @@ impl KelmaSession {
                 "client_modified_at": rfc3339_from_secs(*cmod),
             }));
         }
+
+        let review_payloads = if review_sync_supported {
+            local_reviews
+                .iter()
+                .filter(|(review_id, _)| !server_review_checksums.contains_key(review_id))
+                .map(|(review_id, review)| review.payload(*review_id))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let study_day_payloads = if review_sync_supported {
+            local_study_days
+                .iter()
+                .filter(|record| {
+                    V2_STUDY_DAY_FIELDS
+                        .iter()
+                        .any(|(_, wire)| json_i64(record.get(*wire)) != 0)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         // Mobile-created notes/cards may reference metadata that does not exist
         // on the server yet. Publish that metadata first so FK validation can
@@ -2542,9 +2670,107 @@ impl KelmaSession {
             .map_err(|e| format!("clear uploaded card {guid}:{ord}: {e}"))?;
         }
 
+        let mut converged_review_ids = server_review_checksums
+            .keys()
+            .filter(|review_id| {
+                local_reviews
+                    .get(review_id)
+                    .is_some_and(|review| review.usn == -1)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut pushed_reviews = 0usize;
+        for chunk in review_payloads.chunks(3000) {
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/push",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": [], "reviews": chunk, "study_days": [],
+                    "notetypes": [], "decks": []
+                })),
+            )?;
+            let conflicts = resp
+                .get("conflicts")
+                .and_then(|value| value.get("reviews"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !conflicts.is_empty() {
+                let ids = conflicts
+                    .iter()
+                    .filter_map(|value| value.get("review_id").and_then(Value::as_i64))
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!("KELMA_CONTENT_CONFIRM:review history {ids}"));
+            }
+            let accepted = resp
+                .get("accepted")
+                .and_then(|value| value.get("reviews"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if accepted != chunk.len() {
+                return Err(format!(
+                    "server accepted {accepted}/{} review-history rows",
+                    chunk.len()
+                ));
+            }
+            pushed_reviews += accepted;
+            converged_review_ids.extend(
+                chunk
+                    .iter()
+                    .filter_map(|value| value.get("review_id").and_then(Value::as_i64)),
+            );
+        }
+        for chunk in converged_review_ids.chunks(3000) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(
+                &format!("UPDATE revlog SET usn=0 WHERE usn=-1 AND id IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk.iter()),
+            )
+            .map_err(|e| format!("clear uploaded review history: {e}"))?;
+        }
+
+        let mut pushed_study_days = 0usize;
+        for chunk in study_day_payloads.chunks(1000) {
+            let resp = v2_json(
+                "POST",
+                endpoint,
+                "/v2/batch/push",
+                Some(token),
+                Some(json!({
+                    "notes": [], "cards": [], "reviews": [], "study_days": chunk,
+                    "notetypes": [], "decks": []
+                })),
+            )?;
+            let accepted = resp
+                .get("accepted")
+                .and_then(|value| value.get("study_days"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if accepted != chunk.len() {
+                return Err(format!(
+                    "server accepted {accepted}/{} daily study snapshots",
+                    chunk.len()
+                ));
+            }
+            pushed_study_days += accepted;
+        }
+
         // Capture canonical card IDs after pushes so future card tombstones can
         // be resolved to this collection's logical (guid, ord) identity.
-        let final_manifest = if pushed_notes + pushed_cards + pushed_notetypes + pushed_decks > 0 {
+        let final_manifest = if pushed_notes
+            + pushed_cards
+            + pushed_notetypes
+            + pushed_decks
+            + pushed_reviews
+            + pushed_study_days
+            > 0
+        {
             v2_json("GET", endpoint, "/v2/sync/manifest", Some(token), None)?
         } else {
             manifest.clone()
@@ -2558,14 +2784,18 @@ impl KelmaSession {
                 || added_notes > 0
                 || updated_notes > 0
                 || applied_cards > 0
+                || applied_reviews > 0
+                || applied_study_days > 0
                 || applied_notetypes > 0
                 || applied_decks > 0
                 || pushed_notes > 0
                 || pushed_cards > 0
+                || pushed_reviews > 0
+                || pushed_study_days > 0
                 || pushed_notetypes > 0
                 || pushed_decks > 0,
             message: format!(
-                "v2 sync: pushed {pushed_deletions} local deletion(s), applied {deleted} server deletion(s); pulled {applied_decks} deck(s) ({created_decks} new), {applied_notetypes} notetype(s), {added_notes} new + {updated_notes} updated note(s), {applied_cards} card(s); pushed {pushed_decks} deck(s), {pushed_notetypes} notetype(s), {pushed_notes} note(s), {pushed_cards} card(s)"
+                "v2 sync: pushed {pushed_deletions} local deletion(s), applied {deleted} server deletion(s); pulled {applied_decks} deck(s) ({created_decks} new), {applied_notetypes} notetype(s), {added_notes} new + {updated_notes} updated note(s), {applied_cards} card(s), {applied_reviews} review(s), {applied_study_days} daily counter(s); pushed {pushed_decks} deck(s), {pushed_notetypes} notetype(s), {pushed_notes} note(s), {pushed_cards} card(s), {pushed_reviews} review(s), {pushed_study_days} daily counter(s)"
             ),
         })
     }
@@ -2931,7 +3161,7 @@ impl KelmaSession {
         let media_folder_path = guard.media_folder_path.clone();
         let media_db_path = guard.media_db_path.clone();
 
-        let (notes_removed, cards_removed, decks_removed) = {
+        let (notes_removed, cards_removed, reviews_removed, decks_removed) = {
             let col = guard
                 .col
                 .as_mut()
@@ -2985,9 +3215,20 @@ impl KelmaSession {
                 col.remove_decks_and_child_decks(&ids)
                     .map_err(|e| format!("remove decks for reset: {e:?}"))?;
             }
+            let reviews_removed: i64 = col
+                .storage
+                .db()
+                .query_row("SELECT count(*) FROM revlog", [], |row| row.get(0))
+                .unwrap_or(0);
+            col.storage.db().execute("DELETE FROM revlog", []).ok();
             // These native sync graves describe the local wipe, not user intent.
             col.storage.db().execute("DELETE FROM graves", []).ok();
-            (note_ids.len(), card_ids.len(), deck_ids.len())
+            (
+                note_ids.len(),
+                card_ids.len(),
+                reviews_removed.max(0) as usize,
+                deck_ids.len(),
+            )
         };
 
         // Close media handles before clearing files/state, then reopen the same
@@ -3028,6 +3269,7 @@ impl KelmaSession {
             "reset": true,
             "notesRemoved": notes_removed,
             "cardsRemoved": cards_removed,
+            "reviewsRemoved": reviews_removed,
             "decksRemoved": decks_removed,
         }))
     }
@@ -3131,6 +3373,39 @@ struct LocalV2Card {
     checksum: String,
     modified: String,
     usn: i64,
+}
+
+struct LocalV2Review {
+    checksum: String,
+    source_card_id: i64,
+    note_guid: String,
+    card_ord: i64,
+    deck_name: String,
+    ease: i64,
+    interval: i64,
+    last_interval: i64,
+    factor: i64,
+    taken_millis: i64,
+    review_kind: i64,
+    usn: i64,
+}
+
+impl LocalV2Review {
+    fn payload(&self, review_id: i64) -> Value {
+        json!({
+            "review_id": review_id,
+            "source_card_id": self.source_card_id,
+            "note_guid": self.note_guid,
+            "card_ord": self.card_ord,
+            "deck_name": self.deck_name,
+            "ease": self.ease,
+            "interval": self.interval,
+            "last_interval": self.last_interval,
+            "factor": self.factor,
+            "taken_millis": self.taken_millis,
+            "review_kind": self.review_kind,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -3686,6 +3961,340 @@ fn v2_checksum_parts(parts: &[Value]) -> String {
 
 fn v2_note_checksum(fields: &[String], tags: &[String]) -> String {
     v2_checksum_parts(&[json!(fields), json!(tags)])
+}
+
+fn v2_review_checksum(
+    note_guid: &str,
+    card_ord: i64,
+    ease: i64,
+    interval: i64,
+    last_interval: i64,
+    factor: i64,
+    taken_millis: i64,
+    review_kind: i64,
+) -> String {
+    v2_checksum_parts(&[
+        json!(note_guid),
+        json!(card_ord),
+        json!(ease),
+        json!(interval),
+        json!(last_interval),
+        json!(factor),
+        json!(taken_millis),
+        json!(review_kind),
+    ])
+}
+
+fn local_v2_reviews(col: &mut Collection) -> Result<HashMap<i64, LocalV2Review>, String> {
+    let db = col.storage.db();
+    let mut stmt = db
+        .prepare(
+            "SELECT r.id, r.cid, r.usn, r.ease, r.ivl, r.lastIvl, r.factor, r.time, r.type, \
+                    COALESCE(n.guid, ''), COALESCE(c.ord, 0), COALESCE(d.name, '') \
+             FROM revlog r \
+             LEFT JOIN cards c ON c.id=r.cid \
+             LEFT JOIN notes n ON n.id=c.nid \
+             LEFT JOIN decks d ON d.id=CASE WHEN c.odid != 0 THEN c.odid ELSE c.did END \
+             ORDER BY r.id",
+        )
+        .map_err(|e| format!("prepare local review history: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        })
+        .map_err(|e| format!("query local review history: {e}"))?;
+    let mut reviews = HashMap::new();
+    for row in rows {
+        let (
+            review_id,
+            source_card_id,
+            usn,
+            ease,
+            interval,
+            last_interval,
+            factor,
+            taken_millis,
+            review_kind,
+            note_guid,
+            card_ord,
+            deck_name,
+        ) = row.map_err(|e| format!("read local review history: {e}"))?;
+        let checksum = v2_review_checksum(
+            &note_guid,
+            card_ord,
+            ease,
+            interval,
+            last_interval,
+            factor,
+            taken_millis,
+            review_kind,
+        );
+        reviews.insert(
+            review_id,
+            LocalV2Review {
+                checksum,
+                source_card_id,
+                note_guid,
+                card_ord,
+                deck_name,
+                ease,
+                interval,
+                last_interval,
+                factor,
+                taken_millis,
+                review_kind,
+                usn,
+            },
+        );
+    }
+    Ok(reviews)
+}
+
+fn v2_review_card_map(
+    col: &Collection,
+) -> Result<(HashMap<(String, i64), i64>, HashSet<i64>), String> {
+    let db = col.storage.db();
+    let mut statement = db
+        .prepare("SELECT n.guid, c.ord, c.id FROM cards c JOIN notes n ON n.id=c.nid")
+        .map_err(|e| format!("prepare review card map: {e}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("query review card map: {e}"))?;
+    let mut by_identity = HashMap::new();
+    let mut occupied = HashSet::new();
+    for row in rows {
+        let (guid, card_ord, card_id) = row.map_err(|e| format!("read review card map: {e}"))?;
+        by_identity.insert((guid, card_ord), card_id);
+        occupied.insert(card_id);
+    }
+    Ok((by_identity, occupied))
+}
+
+fn apply_v2_review(
+    col: &mut Collection,
+    record: &Value,
+    card_ids: &HashMap<(String, i64), i64>,
+    occupied_card_ids: &HashSet<i64>,
+) -> Result<bool, String> {
+    let review_id = json_i64(record.get("review_id"));
+    if review_id <= 0 {
+        return Ok(false);
+    }
+
+    let note_guid = record
+        .get("note_guid")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let card_ord = json_i64(record.get("card_ord"));
+    let mut cid = if note_guid.is_empty() {
+        None
+    } else {
+        card_ids.get(&(note_guid.to_string(), card_ord)).copied()
+    };
+    if cid.is_none() {
+        let source_cid = json_i64(record.get("source_card_id"));
+        cid = Some(
+            if source_cid != 0 && !occupied_card_ids.contains(&source_cid) {
+                source_cid
+            } else {
+                -(source_cid
+                    .checked_abs()
+                    .unwrap_or(i64::MAX)
+                    .max(review_id.checked_abs().unwrap_or(i64::MAX)))
+            },
+        );
+    }
+
+    col.storage
+        .db()
+        .execute(
+            "INSERT OR IGNORE INTO revlog \
+             (id,cid,usn,ease,ivl,lastIvl,factor,time,type) \
+             VALUES (?,?,0,?,?,?,?,?,?)",
+            params![
+                review_id,
+                cid.unwrap_or(-review_id),
+                json_i64(record.get("ease")),
+                json_i64(record.get("interval")),
+                json_i64(record.get("last_interval")),
+                json_i64(record.get("factor")),
+                json_i64(record.get("taken_millis")),
+                json_i64(record.get("review_kind")),
+            ],
+        )
+        .map_err(|e| format!("apply review {review_id}: {e}"))?;
+    Ok(true)
+}
+
+const V2_STUDY_DAY_FIELDS: [(&str, &str); 4] = [
+    ("newToday", "new_studied"),
+    ("revToday", "review_studied"),
+    ("lrnToday", "learning_studied"),
+    ("timeToday", "milliseconds_studied"),
+];
+
+fn v2_counter_pair(value: Option<&Value>) -> Option<(i64, i64)> {
+    let values = value?.as_array()?;
+    Some((json_i64(values.first()), json_i64(values.get(1))))
+}
+
+fn local_v2_study_days(col: &mut Collection) -> Result<Vec<Value>, String> {
+    let crt: i64 = col
+        .storage
+        .db()
+        .query_row("SELECT crt FROM col", [], |row| row.get(0))
+        .unwrap_or(0);
+    let crt_day = crt / 86400;
+    let mut records = Vec::new();
+    for (did, name) in col
+        .get_all_deck_names(false)
+        .map_err(|e| format!("list decks for daily counters: {e:?}"))?
+    {
+        let raw = col
+            .get_deck_legacy(anki_proto::decks::DeckId { did: did.0 })
+            .map_err(|e| format!("read daily counters for {name}: {e:?}"))?;
+        let deck: Value = serde_json::from_slice(&raw.json)
+            .map_err(|e| format!("decode daily counters for {name}: {e}"))?;
+        let pairs = V2_STUDY_DAY_FIELDS
+            .iter()
+            .map(|(local, _)| v2_counter_pair(deck.get(*local)))
+            .collect::<Vec<_>>();
+        let Some(local_day) = pairs.iter().flatten().map(|pair| pair.0).max() else {
+            continue;
+        };
+        let mut record = serde_json::Map::new();
+        record.insert("day".to_string(), json!(crt_day + local_day));
+        record.insert("deck_name".to_string(), json!(name));
+        for ((_, wire), pair) in V2_STUDY_DAY_FIELDS.iter().zip(pairs) {
+            let amount = pair
+                .filter(|(day, _)| *day == local_day)
+                .map(|(_, amount)| amount)
+                .unwrap_or(0);
+            record.insert((*wire).to_string(), json!(amount));
+        }
+        records.push(Value::Object(record));
+    }
+    Ok(records)
+}
+
+fn merge_v2_study_day(left: Option<&Value>, right: &Value) -> Value {
+    let Some(left) = left else {
+        return right.clone();
+    };
+    let left_day = json_i64(left.get("day"));
+    let right_day = json_i64(right.get("day"));
+    if left_day != right_day {
+        return if right_day > left_day {
+            right.clone()
+        } else {
+            left.clone()
+        };
+    }
+    let mut merged = left.as_object().cloned().unwrap_or_default();
+    for (_, wire) in V2_STUDY_DAY_FIELDS {
+        merged.insert(
+            wire.to_string(),
+            json!(json_i64(left.get(wire)).max(json_i64(right.get(wire)))),
+        );
+    }
+    Value::Object(merged)
+}
+
+fn merged_v2_study_days(server: &[Value], local: &[Value]) -> Vec<Value> {
+    let mut by_key: HashMap<(i64, String), Value> = HashMap::new();
+    for record in server.iter().chain(local) {
+        let day = json_i64(record.get("day"));
+        let name = record
+            .get("deck_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let key = (day, name);
+        let merged = merge_v2_study_day(by_key.get(&key), record);
+        by_key.insert(key, merged);
+    }
+    let mut latest: HashMap<String, Value> = HashMap::new();
+    for ((day, name), record) in by_key {
+        let replace = latest
+            .get(&name)
+            .map(|current| day > json_i64(current.get("day")))
+            .unwrap_or(true);
+        if replace {
+            latest.insert(name, record);
+        }
+    }
+    latest.into_values().collect()
+}
+
+fn apply_v2_study_days(col: &mut Collection, records: &[Value]) -> Result<usize, String> {
+    let crt: i64 = col
+        .storage
+        .db()
+        .query_row("SELECT crt FROM col", [], |row| row.get(0))
+        .unwrap_or(0);
+    let crt_day = crt / 86400;
+    let mut applied = 0;
+    for record in records {
+        let name = record
+            .get("deck_name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(did) = deck_id_by_name(col, name)? else {
+            continue;
+        };
+        let raw = col
+            .get_deck_legacy(anki_proto::decks::DeckId { did: did.0 })
+            .map_err(|e| format!("read deck {name} for daily counters: {e:?}"))?;
+        let mut deck: Value = serde_json::from_slice(&raw.json)
+            .map_err(|e| format!("decode deck {name} for daily counters: {e}"))?;
+        let Some(object) = deck.as_object_mut() else {
+            continue;
+        };
+        let local_day = json_i64(record.get("day")) - crt_day;
+        let mut changed = false;
+        for (local, wire) in V2_STUDY_DAY_FIELDS {
+            let next = json!([local_day, json_i64(record.get(wire))]);
+            if object.get(local) != Some(&next) {
+                object.insert(local.to_string(), next);
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let encoded = serde_json::to_vec(&deck)
+            .map_err(|e| format!("encode deck {name} daily counters: {e}"))?;
+        let _ = col
+            .add_or_update_deck_legacy(anki_proto::decks::AddOrUpdateDeckLegacyRequest {
+                deck: encoded,
+                preserve_usn_and_mtime: true,
+            })
+            .map_err(|e| format!("apply deck {name} daily counters: {e:?}"))?;
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 fn normalize_v2_deck_config(value: &Value) -> Value {
@@ -4935,6 +5544,33 @@ mod v2_tests {
     }
 
     #[test]
+    fn review_checksum_matches_python_and_server() {
+        assert_eq!(
+            v2_review_checksum("g1", 0, 3, 10, 1, 2500, 4000, 1),
+            "46a3a58da871440db7ede339f4ccaf508f5283d5060e20a705c1c3b889d7a17a"
+        );
+    }
+
+    #[test]
+    fn daily_study_snapshots_merge_monotonically() {
+        let server = vec![json!({
+            "day": 20653, "deck_name": "Deck", "new_studied": 20,
+            "review_studied": 10, "learning_studied": 0,
+            "milliseconds_studied": 1000,
+        })];
+        let local = vec![json!({
+            "day": 20653, "deck_name": "Deck", "new_studied": 5,
+            "review_studied": 62, "learning_studied": 0,
+            "milliseconds_studied": 500,
+        })];
+        let merged = merged_v2_study_days(&server, &local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["new_studied"], 20);
+        assert_eq!(merged[0]["review_studied"], 62);
+        assert_eq!(merged[0]["milliseconds_studied"], 1000);
+    }
+
+    #[test]
     fn rfc3339_round_trip() {
         for seconds in [0, 1, 1_720_656_789, 1_783_820_000] {
             let encoded = rfc3339_from_secs(seconds);
@@ -5121,6 +5757,94 @@ mod v2_tests {
             stable["serverMessage"]
         );
 
+        // Full review history is append-only and card ids are remapped through
+        // (note_guid, ord) when another collection downloads it.
+        let review_id = TimestampMillis::now().0;
+        let source_review_card: i64 = source
+            .with_col_result(|col| {
+                let cid = col
+                    .storage
+                    .db()
+                    .query_row("SELECT id FROM cards WHERE nid=?", [source_nid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())?;
+                col.storage
+                    .db()
+                    .execute(
+                        "INSERT INTO revlog (id,cid,usn,ease,ivl,lastIvl,factor,time,type) \
+                         VALUES (?,?,-1,3,10,1,2500,4000,1)",
+                        (review_id, cid),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let raw = col
+                    .get_deck_legacy(anki_proto::decks::DeckId { did: 1 })
+                    .map_err(|e| format!("read source daily counter: {e:?}"))?;
+                let mut deck: Value =
+                    serde_json::from_slice(&raw.json).map_err(|e| e.to_string())?;
+                let local_day = deck
+                    .get("newToday")
+                    .and_then(Value::as_array)
+                    .and_then(|values| values.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let object = deck.as_object_mut().unwrap();
+                object.insert("newToday".to_string(), json!([local_day, 20]));
+                object.insert("timeToday".to_string(), json!([local_day, 60000]));
+                let encoded = serde_json::to_vec(&deck).map_err(|e| e.to_string())?;
+                let _ = col
+                    .add_or_update_deck_legacy(anki_proto::decks::AddOrUpdateDeckLegacyRequest {
+                        deck: encoded,
+                        preserve_usn_and_mtime: true,
+                    })
+                    .map_err(|e| format!("write source daily counter: {e:?}"))?;
+                Ok(cid)
+            })
+            .unwrap();
+        source.sync_collection(&auth).unwrap();
+        target.sync_collection(&auth).unwrap();
+        let (target_review, target_review_card): ((i64, i64, i64), i64) = target
+            .with_col_result(|col| {
+                let review = col
+                    .storage
+                    .db()
+                    .query_row(
+                        "SELECT r.cid, r.usn, r.ease FROM revlog r WHERE r.id=?",
+                        [review_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let cid = col
+                    .storage
+                    .db()
+                    .query_row(
+                        "SELECT c.id FROM cards c JOIN notes n ON n.id=c.nid WHERE n.guid=? AND c.ord=0",
+                        [source_guid.as_str()],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok((review, cid))
+            })
+            .unwrap();
+        let _ = source_review_card;
+        assert_eq!(target_review.0, target_review_card);
+        assert_eq!((target_review.1, target_review.2), (0, 3));
+        let target_daily_new: i64 = target
+            .with_col_result(|col| {
+                let raw = col
+                    .get_deck_legacy(anki_proto::decks::DeckId { did: 1 })
+                    .map_err(|e| format!("read target daily counter: {e:?}"))?;
+                let deck: Value = serde_json::from_slice(&raw.json).map_err(|e| e.to_string())?;
+                Ok(deck
+                    .get("newToday")
+                    .and_then(Value::as_array)
+                    .and_then(|values| values.get(1))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0))
+            })
+            .unwrap();
+        assert_eq!(target_daily_new, 20);
+
         // The visible comparison and its note detail/force controls must use
         // v2 resources too; the legacy /sync/inspect API does not exist.
         let visible = target.server_manifest(&auth).unwrap();
@@ -5158,7 +5882,7 @@ mod v2_tests {
         let reset = target.reset_for_v2_restore().unwrap();
         assert_eq!(reset["reset"], true);
         assert_eq!(target.get_sync_auth().unwrap()["hkey"], token);
-        let empty: (i64, i64) = target
+        let empty: (i64, i64, i64) = target
             .with_col_result(|col| {
                 let db = col.storage.db();
                 let notes = db
@@ -5167,14 +5891,26 @@ mod v2_tests {
                 let cards = db
                     .query_row("SELECT count(*) FROM cards", [], |row| row.get(0))
                     .map_err(|e| e.to_string())?;
-                Ok((notes, cards))
+                let reviews = db
+                    .query_row("SELECT count(*) FROM revlog", [], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                Ok((notes, cards, reviews))
             })
             .unwrap();
-        assert_eq!(empty, (0, 0));
+        assert_eq!(empty, (0, 0, 0));
         assert!(!target_media.exists());
         target.sync_collection(&auth).unwrap();
         target.sync_media(&auth).unwrap();
         assert_eq!(std::fs::read(&target_media).unwrap(), b"mobile-media-v1");
+        let restored_reviews: i64 = target
+            .with_col_result(|col| {
+                col.storage
+                    .db()
+                    .query_row("SELECT count(*) FROM revlog", [], |row| row.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(restored_reviews, 1);
 
         // Same-name server replacements must invalidate the downloaded-media
         // baseline and overwrite the stale local file.

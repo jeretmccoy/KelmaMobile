@@ -40,9 +40,10 @@ it as a JNI shared library. Both expose the identical coarse JSON contract.
 Kelma ships pointed at the production **KelmaSync v2** REST service at
 `https://sync2.kelma.tech`. The default endpoint lives in
 [`src/config.ts`](./src/config.ts) (`DEFAULT_SYNC_ENDPOINT`). Native sync compares
-canonical checksums, transfers notes/cards in 3,000-item batches, converts
-collection-relative due dates, applies tombstones safely, uploads mobile-created
-metadata and deletions, and transfers referenced media with 50 connections.
+canonical checksums, transfers notes/cards and complete review history in
+3,000-item batches, converts collection-relative due dates and daily-limit
+counters, applies tombstones safely, uploads mobile-created metadata and
+deletions, and transfers referenced media with 50 connections.
 Tied content changes and deletion-vs-local-edit conflicts always ask the user
 which result to keep.
 

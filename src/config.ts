@@ -14,7 +14,7 @@
 export const DEFAULT_SYNC_ENDPOINT = 'https://sync2.kelma.tech';
 
 /** App/update identity. AltStore performs the actual iOS installation. */
-export const MOBILE_APP_VERSION = '1.1.6';
+export const MOBILE_APP_VERSION = '1.1.7';
 export const UPDATE_MANIFEST_URL = 'https://kelma.tech/updates/v1.json';
 export const ALTSTORE_UPDATE_URL = 'https://kelma.tech/altstore/';
 
@@ -33,7 +33,7 @@ export const KELMA_SIGNUP_URL = 'https://kelma.tech';
  * The client version string reported to the sync server. Tracks the pinned
  * Anki/rslib core so the server can apply protocol compatibility rules.
  */
-export const SYNC_CLIENT_VERSION = 'kelma-mobile,1.1.6,anki25.09.2';
+export const SYNC_CLIENT_VERSION = 'kelma-mobile,1.1.7,anki25.09.2';
 
 /** Identifier of the active profile (single-profile for now). */
 export const DEFAULT_PROFILE_ID = 'default';
